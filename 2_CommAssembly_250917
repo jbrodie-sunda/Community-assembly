@@ -1,0 +1,1196 @@
+
+
+###################################################################################################
+### Community assembly model for NEON small mammal data ###
+
+# We split the data into training and testing sets using k-fold cross-validation. For each fold:
+
+# 1) Estimate environmental carrying capacity (ECC) — the total number of individuals across all 
+#     species at a site (actually "siteHabitat") — as a function of environmental conditions using a 
+#     Bayesian brm() regression with natural splines. Predicted ECCs are post hoc bounded to fall within the 
+#     observed range of ECCs across all sites.
+
+# 2) Estimate the "raw abundance" of each species at each site as a function of species traits, 
+#     environmental conditions, and their interactions (trait–environment relationships) using a 
+#     Bayesian brm() regression.
+
+# 3) Apply thresholds to raw abundance estimates: ## NOT CURRENTLY USED ##
+#     -Set values below a user-defined threshold ("abundCutoff") to 0
+#     -Cap values above the maximum observed abundance (across all sites and species)
+
+# 4) Calculate relative abundances as raw abundances divided by the total predicted abundance 
+#     at that site.
+#     -Constrain relative abundances by setting to 0 the abundance of a species where:
+#	  i. min environmental temperatures are colder than the (corrected) species' minimum temperature tolerance
+#	  ii. max env temperatures are hotter than the (corrected) species' max temp tolerance
+#	  iii. env precip levels are outside the range of the species min:max precip tolerances
+
+# 5) Calculate "scaled abundance" by multiplying each species’ relative abundance by the 
+#     site’s predicted ECC — this allocates the total expected number of individuals at a site 
+#     across species based on their relative predicted abundance.
+
+# 6) Calculate and store outputs for each site:
+#     -Observed and predicted ECC
+#     -Observed and predicted species abundances
+#     -Observed and predicted species richness
+
+# Aspects of the approach that I consider to be "training wheels"
+#	-Just using EltonTraits traits did not allow for sufficient filtering, in that nearly all species were
+#	 predicted to occur at nearly all sites. So I added information on environmental tolerances as "pseudo-traits".
+#	 In the previous script ("1_DataProcessing"), I downloaded species ranges, matched them to climate variables, and calcualted
+# 	 the min (5th percentile of the suite of min temps) and max (95th percentile of the suite of max temps) 
+#      monthly temperature, and the min (5th pct) and max (95th pct) total annual precip, anywhere within each species'
+#	 range. In future this could be replaced with empirical data on species-specific critical thermal limits 
+#	 (and drought tolerance?), but the GlobTherm data are currently far too sparse for this
+#	-Estimated ECCs and abundances are post hoc bounded to be <= the max observed ECC and abund
+
+# Conceptual stuff
+# 	-There's plenty of evidence that communities are not "bounded" for particular taxa or over particular
+# 	 spatial/temporal scales. In that case, the ECC approach is not supported. So then community composition
+# 	 would be entirely determined by trait-environment filtering. Given that our traits currently aren't
+#	 doing much filtering, the ECCs can be another training wheel to constrain diversity. But there are other 
+# 	 communities/scales that *do* appear to be bounded, so keeping the ECCs in there makes the model more general
+
+# Possible tweaks
+#	-Change structure of ECCmodel and abundModel. (I tried 3- and 4-knot splines for ECCmodel, but 2-knot 
+#	 worked better [lower WAIC].)
+#	-Insert a local abundance estimator for birds in the previous script
+###################################################################################################
+
+
+
+
+
+REDO THE CLIMATE CONSTRAINTS, SO THAT RATHER THAN SETTING THEM FROM SPECIES RANGE MAPS, YOU JUST SET
+THEM BASED OFF OF OBSERVED MIN/MAX CLIMATE DATA IN THE NEON DATASET
+
+
+ADD ANOTHER DIAGNOSTIC - WE SHOULD SEE IF WE'RE ABLE TO GENERATE HOLLOW-CURVE SADs
+
+
+
+
+
+library(tidyverse)
+library(GGally)
+library(splines)
+library(brms)
+library(glmmTMB)
+library(performance)
+
+
+
+
+setwd('C:/Users/Jedediah.Brodie/OneDrive - The University of Montana/Projects (active)/AngieDeanYlva/NEON project')
+
+
+
+
+
+
+
+######################### DATA ############################################
+rm(list = ls())
+
+
+# Data
+mammdat1 <- data.frame(read.csv("MS Community assembly/Analysis/Intermed_data/mammdat1.csv", header = T))
+predators <- data.frame(read.csv("MS Community assembly/Analysis/Intermed_data/predators.csv", header = T))
+
+
+# User-defined parameters
+#kval <- 10 # number of folds for k-fold cross validation ## NOT CURRENTLY USED ##
+abundCutoff_prey <- 0  # min abundance below which a species is considered absent from a site ## NOT CURRENTLY USED ##
+abundCutoff_predator <- 0  # min abundance below which a species is considered absent from a site ## NOT CURRENTLY USED ##
+minTempCorrection <- 0 
+maxTempCorrection <- 0 
+  # temperature corrections because species temperature tolerances and env temperatures were measured very differently 
+
+
+
+
+
+
+
+
+
+
+
+######################### PREP ###############################################################
+# Species and site lists
+mammspplist <- data.frame(species = unique(mammdat1$species))
+mammsitelist <- data.frame(siteHabitat = unique(mammdat1$siteHabitat))
+mammsitelist$SRobs <- NA # observed SR
+for(i in 1:nrow(mammsitelist)){
+  datsite <- subset(mammdat1, siteHabitat == mammsitelist$siteHabitat[i])
+  mammsitelist$SRobs[i] <- length(unique(datsite$species)) }
+predspplist <- data.frame(species = unique(predators$species))
+predsitelist <- data.frame(siteHabitat = unique(predators$siteHabitat))
+predsitelist$SRobs <- NA # observed SR
+for(i in 1:nrow(predsitelist)){
+  datsite <- subset(predators, siteHabitat == predsitelist$siteHabitat[i])
+  predsitelist$SRobs[i] <- length(unique(datsite$species)) }
+predsitelist <- predsitelist[predsitelist$siteHabitat %in% mammsitelist$siteHabitat, ]
+
+
+# Regional species pools
+mammPvec <- mammdat1 %>% # one row per species, with a column for mean abund
+  group_by(species) %>% summarise(
+    mean_abund = mean(abund, na.rm = TRUE), .groups = "drop")
+predPvec <- predators %>% # one row per species, with a column for mean abund
+  group_by(species) %>% summarise(
+    mean_abund = mean(abund, na.rm = TRUE), .groups = "drop")
+
+
+# Species traits (leaving out CTmin and CTmax - the data are too sparse)
+mammTraits <- mammdat1 %>% group_by(species) %>% summarise(
+  Diet.Inv = first(Diet.Inv),
+  Diet.Vend = first(Diet.Vend),
+  Diet.Scav = first(Diet.Scav),
+  Diet.Fruit = first(Diet.Fruit),
+  Diet.Nect = first(Diet.Nect),
+  Diet.Seed = first(Diet.Seed),
+  Diet.Herb = first(Diet.Herb),
+  bodyMass = first(bodyMass), 
+  climbing = first(climbing), 
+  nocturnal = first(nocturnal), 
+  minAmbTemp = first(minAmbTemp), 
+  maxAmbTemp = first(maxAmbTemp), 
+  minAnnPrecip = first(minAnnPrecip), 
+  maxAnnPrecip = first(maxAnnPrecip), .groups = "drop")
+mammPvec <- data.frame(left_join(mammPvec, mammTraits, by = "species"))
+predTraits <- predators %>% group_by(species) %>% summarise(
+  ForStrat.understory = first(ForStrat.understory),
+  ForStrat.midhigh = first(ForStrat.midhigh),
+  ForStrat.canopy = first(ForStrat.canopy),
+  ForStrat.aerial = first(ForStrat.aerial),
+  bodyMass = first(bodyMass), 
+  minAmbTemp = first(minAmbTemp), 
+  maxAmbTemp = first(maxAmbTemp), 
+  minAnnPrecip = first(minAnnPrecip), 
+  maxAnnPrecip = first(maxAnnPrecip), .groups = "drop")
+predPvec <- data.frame(left_join(predPvec, predTraits, by = "species"))
+
+
+# Smammal data with environmental conditions and species traits
+# Env conditions are standardized across siteHabitats; traits are standardized across species
+dat <- mammdat1
+siteHabs <- dplyr::summarise(
+  dplyr::group_by(dat, siteHabitat),
+  elevation   = dplyr::first(elevation),
+  tempCV      = dplyr::first(tempCV),
+  tmin        = dplyr::first(tmin),
+  tmax        = dplyr::first(tmax),
+  precipCV    = dplyr::first(precipCV),
+  precipTotal = dplyr::first(precipTotal),
+  sradMean    = dplyr::first(sradMean),
+  sweMean     = dplyr::first(sweMean),
+  tree        = dplyr::first(tree),
+  shrub       = dplyr::first(shrub),
+  liana       = dplyr::first(liana), .groups = "drop")
+traits_df <- dplyr::summarise(
+  dplyr::group_by(dat, species),
+  Diet.Inv      = dplyr::first(Diet.Inv),
+  Diet.Vend     = dplyr::first(Diet.Vend),
+  Diet.Scav     = dplyr::first(Diet.Scav),
+  Diet.Fruit    = dplyr::first(Diet.Fruit),
+  Diet.Nect     = dplyr::first(Diet.Nect),
+  Diet.Seed     = dplyr::first(Diet.Seed),
+  Diet.Herb     = dplyr::first(Diet.Herb),
+  bodyMass      = dplyr::first(bodyMass),
+  climbing      = dplyr::first(climbing),
+  nocturnal     = dplyr::first(nocturnal),
+  minAmbTemp    = dplyr::first(minAmbTemp),
+  maxAmbTemp    = dplyr::first(maxAmbTemp),
+  minAnnPrecip  = dplyr::first(minAnnPrecip),
+  maxAnnPrecip  = dplyr::first(maxAnnPrecip), .groups = "drop")
+dat <- subset(dat, select = c(siteHabitat,species,genus,family,abund))
+# Standardize environmental covariates
+start_col_env <- match("elevation", names(siteHabs))
+stopifnot(!is.na(start_col_env))
+range_idx_env <- seq.int(start_col_env, ncol(siteHabs))
+# Exclude binaries or categorical encodings if you don’t want to z-score them
+exclude_env_names <- c()
+exclude_env_idx <- match(exclude_env_names, names(siteHabs), nomatch = 0)
+cols_env <- setdiff(range_idx_env, exclude_env_idx)
+is_num_env <- sapply(cols_env, function(j) is.numeric(siteHabs[[j]]))
+cols_env <- cols_env[is_num_env]
+# Save originals, then scale
+orig_env_names <- paste0(names(siteHabs)[cols_env], "_orig")
+siteHabs[orig_env_names] <- siteHabs[, cols_env, drop = FALSE]
+scaled_env <- as.data.frame(scale(siteHabs[, cols_env, drop = FALSE]))
+names(scaled_env) <- names(siteHabs)[cols_env]
+siteHabs[, cols_env] <- scaled_env
+# Standardize traits
+# Skip binaries
+all_idx_traits <- seq_len(ncol(traits_df))
+exclude_traits_idx <- match(c("species", "climbing", "nocturnal"), names(traits_df), nomatch = 0)
+exclude_traits_idx <- exclude_traits_idx[exclude_traits_idx > 0]
+cols_traits <- setdiff(all_idx_traits, exclude_traits_idx)
+# Keep only numeric columns (Diet.* must be numeric to be standardized)
+is_num_traits <- sapply(cols_traits, function(j) is.numeric(traits_df[[j]]))
+cols_traits <- cols_traits[is_num_traits]
+cols_traits <- cols_traits[is_num_traits]
+orig_trait_names <- paste0(names(traits_df)[cols_traits], "_orig")
+traits_df[orig_trait_names] <- traits_df[, cols_traits, drop = FALSE]
+scaled_traits <- as.data.frame(scale(traits_df[, cols_traits, drop = FALSE]))
+names(scaled_traits) <- names(traits_df)[cols_traits]
+traits_df[, cols_traits] <- scaled_traits
+# Join back to siteHabitat × species skeleton
+dat <- left_join(dat, siteHabs, by = "siteHabitat")
+dat <- left_join(dat, traits_df, by = "species")
+dat$precipTotal2 <- dat$precipTotal^2
+dat1 <- dat
+traits_df1 <- traits_df
+rm(dat, siteHabs, traits_df, start_col_env, range_idx_env, exclude_env_names, exclude_env_idx, cols_env,
+  orig_env_names, scaled_env, all_idx_traits, exclude_traits_idx, is_num_traits, cols_traits, orig_trait_names,
+  scaled_traits)
+
+
+# Predator data with environmental conditions and species traits
+# Env conditions are standardized across siteHabitats; traits are standardized across species
+dat <- predators
+siteHabs <- dplyr::summarise(
+  dplyr::group_by(dat, siteHabitat),
+  elevation   = dplyr::first(elevation),
+  tempCV      = dplyr::first(tempCV),
+  tmin        = dplyr::first(tmin),
+  tmax        = dplyr::first(tmax),
+  precipCV    = dplyr::first(precipCV),
+  precipTotal = dplyr::first(precipTotal),
+  sradMean    = dplyr::first(sradMean),
+  sweMean     = dplyr::first(sweMean),
+  tree        = dplyr::first(tree),
+  shrub       = dplyr::first(shrub),
+  liana       = dplyr::first(liana), .groups = "drop")
+traits_df <- dplyr::summarise(
+  dplyr::group_by(dat, species),
+  ForStrat.understory      = dplyr::first(ForStrat.understory),
+  ForStrat.midhigh     = dplyr::first(ForStrat.midhigh),
+  ForStrat.canopy     = dplyr::first(ForStrat.canopy),
+  ForStrat.aerial    = dplyr::first(ForStrat.aerial),
+  bodyMass      = dplyr::first(bodyMass),
+  nocturnal     = first(nocturnal),
+  minAmbTemp    = dplyr::first(minAmbTemp),
+  maxAmbTemp    = dplyr::first(maxAmbTemp),
+  minAnnPrecip  = dplyr::first(minAnnPrecip),
+  maxAnnPrecip  = dplyr::first(maxAnnPrecip), .groups = "drop")
+dat <- subset(dat, select = c(siteHabitat,species,genus,family,abund))
+# Standardize environmental covariates
+start_col_env <- match("elevation", names(siteHabs))
+stopifnot(!is.na(start_col_env))
+range_idx_env <- seq.int(start_col_env, ncol(siteHabs))
+# Exclude binaries or categorical encodings if you don’t want to z-score them
+exclude_env_names <- c()
+exclude_env_idx <- match(exclude_env_names, names(siteHabs), nomatch = 0)
+cols_env <- setdiff(range_idx_env, exclude_env_idx)
+is_num_env <- sapply(cols_env, function(j) is.numeric(siteHabs[[j]]))
+cols_env <- cols_env[is_num_env]
+# Save originals, then scale
+orig_env_names <- paste0(names(siteHabs)[cols_env], "_orig")
+siteHabs[orig_env_names] <- siteHabs[, cols_env, drop = FALSE]
+scaled_env <- as.data.frame(scale(siteHabs[, cols_env, drop = FALSE]))
+names(scaled_env) <- names(siteHabs)[cols_env]
+siteHabs[, cols_env] <- scaled_env
+# Standardize traits
+# Skip binaries
+all_idx_traits <- seq_len(ncol(traits_df))
+exclude_traits_idx <- match(c("species", "nocturnal"), names(traits_df), nomatch = 0)
+exclude_traits_idx <- exclude_traits_idx[exclude_traits_idx > 0]
+cols_traits <- setdiff(all_idx_traits, exclude_traits_idx)
+# Keep only numeric columns
+is_num_traits <- sapply(cols_traits, function(j) is.numeric(traits_df[[j]]))
+cols_traits <- cols_traits[is_num_traits]
+cols_traits <- cols_traits[is_num_traits]
+orig_trait_names <- paste0(names(traits_df)[cols_traits], "_orig")
+traits_df[orig_trait_names] <- traits_df[, cols_traits, drop = FALSE]
+scaled_traits <- as.data.frame(scale(traits_df[, cols_traits, drop = FALSE]))
+names(scaled_traits) <- names(traits_df)[cols_traits]
+traits_df[, cols_traits] <- scaled_traits
+# Join back to siteHabitat × species skeleton
+dat <- left_join(dat, siteHabs, by = "siteHabitat")
+dat <- left_join(dat, traits_df, by = "species")
+dat$precipTotal2 <- dat$precipTotal^2
+dat2 <- dat
+traits_df2 <- traits_df
+rm(dat, siteHabs, traits_df, start_col_env, range_idx_env, exclude_env_names, exclude_env_idx, cols_env,
+  orig_env_names, scaled_env, all_idx_traits, exclude_traits_idx, is_num_traits, cols_traits, orig_trait_names,
+  scaled_traits)
+
+
+# The ECC model for predators will include prey abund; divide prey into 3 +/- equal groups
+q <- quantile(mammTraits$bodyMass, probs = c(0.33, 0.66), na.rm = TRUE)
+mammTraits$bodySize <- cut(
+  mammTraits$bodyMass,
+  breaks = c(-Inf, q[1], q[2], Inf),
+  labels = c("small", "medium", "large"))
+
+
+
+
+
+
+
+
+
+######################### PREY MODEL-FITTING ###############################################
+.prey_before <- ls() # snapshot of current model objects
+abundCutoff <- abundCutoff_prey
+sppdat <- dat1
+traits_df <- traits_df1
+spplist <- mammspplist
+sitelist0 <- mammsitelist
+
+
+# Prep modeling
+site_abund <- sppdat %>%
+  group_by(siteHabitat) %>%
+  summarize(
+    total_abund = sum(abund, na.rm = TRUE),
+    elevation = first(elevation),
+    tempCV = first(tempCV),
+    tmin = first(tmin),
+    #tmax = first(tmax),
+    precipCV = first(precipCV),
+    precipTotal = first(precipTotal),
+    sradMean = first(sradMean),
+    sweMean = first(sweMean),
+    tree = first(tree),
+    shrub = first(shrub),
+    liana = first(liana)  )
+mu_site <- log(median(site_abund$total_abund, na.rm = TRUE))
+
+
+
+
+#----- Environmental carrying capacity (ECC) model; how many indivs (across all spp) a siteHabitat can support -----#
+# Predictors
+predictors0 <- c("elevation", "tempCV", "tmin", "tmax", "precipCV", "precipTotal", "sradMean", "sweMean",
+  "tree", "shrub", "liana")
+#GGally::ggcorr(site_abund[, predictors0], label = TRUE, label_round = 2)
+# the only problematic correlations (above 0.56) are tmin & tmax (R = 0.69); remove tmax
+
+
+# View all predictor-vs-response relationships
+predictors <- c("elevation", "tempCV", "tmin", "precipCV", "precipTotal", "sradMean", "sweMean",
+  "tree", "shrub", "liana") # remove tmax
+site_abund_long <- site_abund %>%
+  select(total_abund, all_of(predictors)) %>%
+  pivot_longer(cols = -total_abund, names_to = "predictor", values_to = "x")
+ord <- site_abund_long %>%
+  group_by(predictor) %>%
+  summarize(rho = suppressWarnings(cor(x, total_abund, method = "spearman", use = "complete.obs"))) %>%
+  arrange(desc(abs(rho))) %>%
+  pull(predictor)
+site_abund_long$predictor <- factor(site_abund_long$predictor, levels = ord)
+ggplot(site_abund_long, aes(x = x, y = total_abund)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = TRUE) +
+  labs(x = NULL, y = "Total abundance (ECC)") +
+  facet_wrap(~ predictor, scales = "free_x", ncol = 4) +
+  theme_bw()
+# Potentially influential predictors: tempCV [spline 2], elev [spline 2]; precipTotal [spline 3],
+#  tmin [spline 2], sweMean [spline 2]
+  
+
+# Global model
+ECCformula <- as.formula("total_abund ~ ns(elevation, 2) + ns(tempCV, 2) + ns(tmin, 2) + ns(precipCV, 2) +
+  ns(precipTotal, 3) + ns(sradMean, 2) + ns(sweMean, 2) + tree + shrub + liana")
+ECCmod0 <- brm(
+  ECCformula,
+  family = lognormal(link = "identity"),  # identity link for lognormal
+  data   = site_abund,
+  prior = c(
+    prior(normal(0, 5), class = "b"),
+    set_prior(paste0("normal(", mu_site, ", 2)"), class = "Intercept"),  
+    prior(exponential(1), class = "sigma")  ),
+  chains = 4, cores = 4, iter = 6000,
+  control = list(adapt_delta = 0.999, max_treedepth = 20))
+ 
+
+# Subset model 1 - potentially influential predictors
+ECCformula <- as.formula("total_abund ~ ns(tempCV, 2) + ns(elevation, 2) + ns(precipTotal, 3) + 
+  ns(tmin, 2) + ns(sweMean, 2)")
+ECCmod1 <- brm(
+  ECCformula,
+  family = lognormal(link = "identity"),  # identity link for lognormal
+  data   = site_abund,
+  prior  = c(
+    prior(normal(0, 5), class = "b"),
+    set_prior(paste0("normal(", round(mu_site, 3), ", 0.5)"), class = "Intercept"),
+    prior(exponential(1), class = "sigma")  ),
+  chains = 4, cores = 4, iter = 6000,
+  control = list(adapt_delta = 0.999, max_treedepth = 20))
+
+
+# Subset model 1 with gamma distribution
+priors_gamma <- c(
+  prior(normal(0, 1), class = "b"),
+  prior(normal(1.250616, 0.5), class = "Intercept"),  # <-- inline the number
+  prior(exponential(1), class = "shape"))
+ECCmod1gamma <- brm(total_abund ~ ns(tempCV, 2) + ns(elevation, 2) + ns(precipTotal, 3) + 
+  ns(tmin, 2) + ns(sweMean, 2),
+  family  = Gamma(link = "log"),
+  data    = site_abund,
+  prior   = priors_gamma,
+  chains  = 4, cores = 4, iter = 6000,
+  control = list(adapt_delta = 0.999, max_treedepth = 20))
+
+
+# Subset model 2 with gamma distribution (removing SWE)
+ECCmod2gamma <- brm(total_abund ~ ns(tempCV, 2) + ns(elevation, 2) + ns(precipTotal, 3) + ns(tmin, 2),
+  family  = Gamma(link = "log"),
+  data    = site_abund,
+  prior   = priors_gamma,
+  chains  = 4, cores = 4, iter = 6000,
+  control = list(adapt_delta = 0.999, max_treedepth = 20))
+
+
+# Compare
+loo_compare(loo(ECCmod0), loo(ECCmod1), loo(ECCmod1gamma), loo(ECCmod2gamma)) 
+
+
+
+
+#----- Trait–environment models; how traits and env together influence abundance -----#
+# Predictors
+env_vars0 <- sppdat %>% select(elevation, tempCV, tmin, tmax, precipCV, precipTotal, precipTotal2,
+  sradMean, sweMean, tree, shrub, liana)
+#GGally::ggcorr(env_vars0, label = TRUE, label_round = 2)
+# the only problematic correlations (above 0.54) are tmin & tmax (R = 0.69)
+
+
+# Global model
+# Remove correlated env terms; rm 'liana' which is skewed & has low var; rm traits w/ low var
+traitTerms <- paste(c("Diet.Inv", "Diet.Scav", "Diet.Fruit", "Diet.Seed", "bodyMass", "climbing", 
+  "nocturnal", "minAmbTemp", "maxAmbTemp", "minAnnPrecip", "maxAnnPrecip"), collapse = " + ")
+envTerms <- paste(c("elevation", "tmax", "precipTotal", "precipTotal2", "sradMean", "tree", 
+  "shrub"), collapse = " + ")
+interactionTerms <- paste0("(", traitTerms, ") * (", envTerms, ")")
+# Positive-part formula (lognormal)
+abund_formula <- as.formula(paste("abund ~", interactionTerms))
+# Hurdle (zero) part uses the same predictors
+hu_formula    <- as.formula(paste("hu ~", interactionTerms))
+# Prior location for positive part
+mu_abund <- log(median(sppdat$abund[sppdat$abund > 0], na.rm = TRUE))
+# Build bf() with both parts
+abund_bf <- bf(
+  abund_formula,   # positive part
+  hu_formula   )   # hurdle (logit for zero probability)
+start <- Sys.time()
+mod0 <- brm(
+  formula = abund_bf,
+  family  = hurdle_lognormal(link = "identity"),
+  data    = sppdat,
+  prior   = c(
+    # Positive (lognormal) part
+    prior(normal(0, 1), class = "b"),
+    set_prior(paste0("normal(", mu_abund, ", 2)"), class = "Intercept"),
+    prior(exponential(1), class = "sigma"),
+    # Hurdle (zero) part (logit scale)
+    prior(normal(0, 1), class = "b", dpar = "hu"),
+    prior(normal(0, 1), class = "Intercept", dpar = "hu")  ),
+  chains  = 4, cores = 4, iter = 4000,
+  control = list(adapt_delta = 0.999, max_treedepth = 20))
+Sys.time() - start # 12.8 min
+#summary(mod0); bayes_R2(mod0)
+
+
+# Subset model 1 - predictors that were at least marginal in global model ("marginal" refers to 
+#   terms where the posterior mean is away from 0 and the CI just barely overlaps 0. 
+# If an interaction term is included in the model, both main effects also have to be included
+# Subset model 1 (hurdle lognormal): keep significant + marginal terms from mod0
+# If an interaction is kept, include both main effects.
+# Main effects to retain (pos. part): Diet.Inv (marginal), Diet.Scav (sig),
+# Diet.Seed (needed for kept interactions), minAmbTemp (sig),
+# minAnnPrecip (sig via interactions), maxAnnPrecip (marginal via interaction)
+traitTerms <- paste(c("Diet.Inv", "Diet.Scav", "Diet.Seed", "minAmbTemp", "minAnnPrecip", "maxAnnPrecip"), 
+  collapse = " + ")
+# Environmental mains needed by retained interactions
+envTerms <- paste(c(
+  "elevation", "tmax", "precipTotal", "precipTotal2",
+  "sradMean", "tree"), collapse = " + ")
+# Interactions retained (sig + marginal from mod0)
+interactionTerms <- paste(c(
+  "Diet.Inv:tree",
+  "Diet.Scav:tree",
+  "Diet.Seed:elevation",
+  "Diet.Seed:tmax",
+  "Diet.Seed:precipTotal",
+  "Diet.Seed:precipTotal2",
+  "minAmbTemp:tmax",
+  "minAmbTemp:precipTotal",
+  "minAmbTemp:tree",
+  "minAnnPrecip:elevation",
+  "minAnnPrecip:tmax",
+  "minAnnPrecip:precipTotal",
+  "minAnnPrecip:precipTotal2",
+  "minAnnPrecip:tree",
+  "maxAnnPrecip:precipTotal",
+  # marginal adds
+  "Diet.Inv:sradMean",
+  "Diet.Scav:precipTotal",
+  "Diet.Scav:sradMean"), collapse = " + ")
+all_terms <- paste(c(traitTerms, envTerms, interactionTerms), collapse = " + ")
+abund_formula <- as.formula(paste("abund ~", all_terms))
+# Hurdle (zero) part: no significant/marginal terms in mod0 -> intercept-only
+hu_formula <- as.formula("hu ~ 1")
+# Prior center for positive part
+mu_abund <- log(median(sppdat$abund[sppdat$abund > 0], na.rm = TRUE))
+# Build and fit
+abund_bf <- bf(abund_formula, hu_formula)
+mod1 <- brm(
+  formula = abund_bf,
+  family  = hurdle_lognormal(link = "identity"),
+  data    = sppdat,
+  prior   = c(
+    # Positive (lognormal) part
+    prior(normal(0, 1), class = "b"),
+    set_prior(paste0("normal(", mu_abund, ", 2)"), class = "Intercept"),
+    prior(exponential(1), class = "sigma"),
+    # Hurdle (zero) part (intercept-only)
+    prior(normal(0, 1), class = "Intercept", dpar = "hu")  ),
+  chains  = 4, cores = 4, iter = 4000,
+  control = list(adapt_delta = 0.999, max_treedepth = 20))
+#summary(mod1); bayes_R2(mod1)
+
+
+# Subset model 2 (hurdle lognormal): keep significant + marginal terms from mod1
+# If an interaction is included, include both main effects.
+# Main effects to retain (from mod1)
+traitTerms <- paste(c(
+  "Diet.Inv",        # significant
+  "Diet.Scav",       # significant
+  "minAmbTemp",      # significant
+  "minAnnPrecip",    # marginal; also needed for its interactions
+  "maxAnnPrecip"     # significant
+  ), collapse = " + ")
+envTerms <- paste(c(
+  "tmax",            # needed for minAmbTemp:tmax
+  "precipTotal",     # needed for maxAnnPrecip:precipTotal
+  "precipTotal2",    # needed for minAnnPrecip:precipTotal2
+  "sradMean",        # significant; needed for Diet.Inv:sradMean
+  "tree"             # significant; needed for Diet.Scav:tree and Diet.Inv:tree
+  ), collapse = " + ")
+# Interactions to retain (significant + marginal in mod1)
+interactionTerms <- paste(c(
+  "Diet.Scav:tree",          # significant
+  "minAmbTemp:tmax",         # significant
+  "minAmbTemp:tree",         # significant
+  "minAnnPrecip:precipTotal2", # significant
+  "minAnnPrecip:tree",       # significant
+  "maxAnnPrecip:precipTotal",# significant
+  "Diet.Inv:sradMean",       # significant
+  "Diet.Inv:tree"            # marginal
+  ), collapse = " + ")
+all_terms <- paste(c(traitTerms, envTerms, interactionTerms), collapse = " + ")
+abund_formula <- as.formula(paste("abund ~", all_terms))
+# Hurdle (zero) part: intercept-only per mod1
+hu_formula <- as.formula("hu ~ 1")
+# Prior center for positive part
+mu_abund <- log(median(sppdat$abund[sppdat$abund > 0], na.rm = TRUE))
+# Build and fit mod2
+abund_bf <- bf(abund_formula, hu_formula)
+mod2 <- brm(
+  formula = abund_bf,
+  family  = hurdle_lognormal(link = "identity"),
+  data    = sppdat,
+  prior   = c(
+    # Positive (lognormal) part
+    prior(normal(0, 1), class = "b"),
+    set_prior(paste0("normal(", mu_abund, ", 2)"), class = "Intercept"),
+    prior(exponential(1), class = "sigma"),
+    # Hurdle (zero) part (intercept-only)
+    prior(normal(0, 1), class = "Intercept", dpar = "hu")  ),
+  chains  = 4, cores = 4, iter = 4000,
+  control = list(adapt_delta = 0.999, max_treedepth = 20))
+#summary(mod2); bayes_R2(mod2)
+
+
+# Compare
+loo_compare(loo(mod0), loo(mod1), loo(mod2)) 
+
+
+
+
+
+
+
+######################### PREY MODEL PREDICTIONS ############################################
+Prey_ECCmodel <- ECCmod1gamma
+Prey_abundModel <- mod2
+
+
+
+
+#----- Predicted ECCs across siteHabitats -----#
+allsitesECCobs <- sppdat %>% group_by(siteHabitat) %>% summarise(ECCobs = sum(abund, na.rm = T), .groups = "drop")
+sitelist <- left_join(sitelist0, allsitesECCobs, by = "siteHabitat")
+sppdat_summary <- sppdat %>%
+  group_by(siteHabitat) %>%
+  summarise(
+    elevation = mean(elevation, na.rm = TRUE),
+    tempCV = mean(tempCV, na.rm = TRUE),
+    tmin = mean(tmin, na.rm = TRUE),
+    tmax = mean(tmax, na.rm = TRUE),
+    precipCV = mean(precipCV, na.rm = TRUE),
+    precipTotal = mean(precipTotal, na.rm = TRUE),
+    precipTotal2 = mean(precipTotal2, na.rm = TRUE),
+    sradMean = mean(sradMean, na.rm = TRUE),
+    sweMean = mean(sweMean, na.rm = TRUE),
+    tree = mean(tree, na.rm = TRUE),
+    shrub = mean(shrub, na.rm = TRUE),
+    liana = mean(liana, na.rm = TRUE),
+    tmin_orig = mean(tmin_orig, na.rm = TRUE),
+    tmax_orig = mean(tmax_orig, na.rm = TRUE),
+    precipTotal_orig = mean(precipTotal_orig, na.rm = TRUE),
+    .groups = "drop"  )
+sppdat_capacity <- fitted(Prey_ECCmodel, newdata = sppdat_summary)[, "Estimate"]
+names(sppdat_capacity) <- sppdat_summary$siteHabitat
+sppdat_ECC <- data.frame(siteHabitat = names(sppdat_capacity),
+  ECCpredRaw = as.numeric(sppdat_capacity), row.names = NULL, stringsAsFactors = FALSE)
+sitelist <- left_join(sitelist, sppdat_ECC, by = "siteHabitat")
+sitelist$ECCpred <- ifelse(sitelist$ECCpredRaw > max(sitelist$ECCobs, na.rm = T), 
+  max(sitelist$ECCobs, na.rm = T), sitelist$ECCpredRaw)
+sitelist$ECCpred <- ifelse(sitelist$ECCpred < min(sitelist$ECCobs, na.rm = T), 
+  min(sitelist$ECCobs, na.rm = T), sitelist$ECCpred)
+#cor(sitelist$ECCobs, sitelist$ECCpred)
+#cor(sitelist$ECCpredRaw, sitelist$ECCpred)
+# Manually restricting ECCpred to be within the range of ECCobs not needed here (ECCpredRaw and ECCpred are identical) 
+Prey_ECC <- sitelist
+
+
+
+
+#----- Predicted abundance from trait–environment model (posterior predictive median) -----#
+pred_grid <- expand.grid(siteHabitat = sitelist$siteHabitat, species = spplist$species, stringsAsFactors = FALSE)
+pred_grid <- left_join(pred_grid, sppdat_summary, by = "siteHabitat")
+pred_grid <- left_join(pred_grid, traits_df,      by = "species")
+
+# observed abundance
+obs_df <- sppdat %>% select(siteHabitat, species, abund) %>% rename(abundObs = abund)
+pred_grid <- left_join(pred_grid, obs_df, by = c("siteHabitat", "species"))
+pred_grid$abundObs[is.na(pred_grid$abundObs)] <- 0
+
+# posterior predictive draws from the hurdle model (on response scale; includes exact zeros)
+set.seed(123)
+pp_draws <- posterior_predict(Prey_abundModel, newdata = pred_grid, ndraws = 2000)
+
+# median point prediction per row (can be exactly 0)
+pred_grid$abundPredRaw <- apply(pp_draws, 2, stats::median)
+
+# optional diagnostics: probability of zero and a CI
+pred_grid$p_zero   <- colMeans(pp_draws == 0)
+pred_grid$pred_q10 <- apply(pp_draws, 2, stats::quantile, probs = 0.10)
+pred_grid$pred_q90 <- apply(pp_draws, 2, stats::quantile, probs = 0.90)
+rm(pp_draws); invisible(gc())
+
+# predicted relative and absolute ("scaled") abundance
+tmpAbund <- data.frame(siteHabitat = character(0), species = character(0), 
+  abundPredRel = numeric(0), abundPredScaled = numeric(0))
+maxAbund <- max(sppdat$abund, na.rm = T)
+for(s in 1:nrow(sitelist)){
+  #s=1
+  siteHabitat_s <- sitelist$siteHabitat[s]
+  tmpdat <- subset(pred_grid, siteHabitat == siteHabitat_s)
+  ECC_s <- sitelist$ECCpred[sitelist$siteHabitat == siteHabitat_s]
+
+  # Constrain the raw (absolute) abundance predictions
+  tmpdat$minAmbTemp_corr <- tmpdat$minAmbTemp_orig - minTempCorrection
+  tmpdat$maxAmbTemp_corr <- tmpdat$maxAmbTemp_orig + maxTempCorrection
+  tmpdat$abundAdjusted <- ifelse(tmpdat$minAmbTemp_corr > tmpdat$tmin_orig, 0, tmpdat$abundPredRaw)
+    # if min env temperature (tmin_orig) < the species' minimal thermal tolerance (minAmbTemp_orig), set abundAdjustedto 0
+  tmpdat$abundAdjusted <- ifelse(tmpdat$maxAmbTemp_corr < tmpdat$tmax_orig, 0, tmpdat$abundAdjusted)
+    # if max env temperature (tmax_orig) > the species' max thermal tolerance (maxAmbTemp_orig), set abundAdjustedto 0
+  tmpdat$abundAdjusted <- ifelse(!(tmpdat$precipTotal_orig >= tmpdat$minAnnPrecip_orig &
+    tmpdat$precipTotal_orig <= tmpdat$maxAnnPrecip_orig), 0, tmpdat$abundAdjusted)
+    # if precipTotal_orig (env condition) is outside the range of species' precip tolerances (minAnnPrecip_orig : maxAnnPrecip_orig, set abundAjusted to 0
+  tmpdat$abundAdjusted <- ifelse(tmpdat$abundAdjusted <= abundCutoff, 0, tmpdat$abundAdjusted) # abund has to be greater than the (user-defined) cutoff
+  tmpdat$abundAdjusted <- ifelse(tmpdat$abundAdjusted > maxAbund, maxAbund, tmpdat$abundAdjusted) # abund has to be less than the max observed abundance
+  #tmp <- subset(tmpdat, select = c(minAmbTemp_corr, tmin_orig, maxAmbTemp_corr, tmax_orig, 
+  #  minAnnPrecip_orig, maxAnnPrecip_orig, precipTotal_orig, abundPredRaw, abundAdjusted))
+
+  # Calculate predicted relative abundance (sums to 1)
+  total <- sum(tmpdat$abundAdjusted, na.rm = TRUE)
+  if (total > 0) {tmpdat$abundPredRel <- tmpdat$abundAdjusted / total} else {tmpdat$abundPredRel <- tmpdat$abundAdjusted * 0}
+
+  # Calculate predicted absolute abundance (sums to predicted ECC)
+  tmpdat$abundPredScaled <- tmpdat$abundPredRel * ECC_s
+  tmpAbund_s <- subset(tmpdat, select = c(siteHabitat, species, abundPredRel, abundPredScaled))
+  tmpAbund <- data.frame(rbind(tmpAbund, tmpAbund_s))
+  rm(siteHabitat_s, tmpdat, ECC_s, total, tmpAbund_s)	}
+abundMatrix <- left_join(pred_grid, tmpAbund, by = c("siteHabitat", "species"))
+Prey_abundMatrix <- subset(abundMatrix, select = c(siteHabitat, species, abundObs, abundPredRaw, abundPredScaled))
+
+
+# Evaluate predictions using mean site-wise Spearman ρ between observed and predicted relative abundances
+# i.e., Within each site, how well do predicted vs observed species compositions agree?
+# Helper: safe Spearman that returns NA instead of error
+safe_spearman <- function(x, y, min_n = 3) {
+  ok <- is.finite(x) & is.finite(y)
+  if (sum(ok) < min_n) return(NA_real_)
+  x <- x[ok]; y <- y[ok]
+  if (sd(x) == 0 || sd(y) == 0) return(NA_real_)
+  suppressWarnings(cor(x, y, method = "spearman"))}
+site_rho <- Prey_abundMatrix %>%
+  group_by(siteHabitat) %>%
+  mutate(
+    obs_sum  = sum(abundObs, na.rm = TRUE),
+    pred_sum = sum(abundPredScaled, na.rm = TRUE),
+    obs_rel  = ifelse(obs_sum  > 0, abundObs        / obs_sum,  NA_real_),
+    pred_rel = ifelse(pred_sum > 0, abundPredScaled / pred_sum, NA_real_)
+  ) %>%
+  # keep species that contribute to at least one composition
+  filter((obs_rel > 0) | (pred_rel > 0)) %>%
+  summarise(
+    n_complete = sum(is.finite(obs_rel) & is.finite(pred_rel)),
+    rho = safe_spearman(obs_rel, pred_rel),
+    .groups = "drop"  )
+Prey_mean_site_rho <- mean(site_rho$rho, na.rm = TRUE)
+# sum(is.finite(site_rho$rho)) # How many sites contributed a finite rho?
+
+
+
+
+#----- Species richness -----#
+Prey_SppRich <- data.frame(siteHabitat = character(0), SRobs = numeric(0), 
+  SRpredRaw = numeric(0), SRpredScaled = numeric(0))
+for(s in 1:nrow(sitelist)){
+  #s=2
+  SppRich_s <- data.frame(siteHabitat = sitelist$siteHabitat[s], SRobs = NA, SRpredRaw = NA, SRpredScaled = NA)  
+  tmpdat <- subset(Prey_abundMatrix, siteHabitat == sitelist$siteHabitat[s])
+  SppRich_s$SRobs <- nrow(subset(tmpdat, abundObs > 0))
+  SppRich_s$SRpredRaw <- nrow(subset(tmpdat, abundPredRaw > 0))
+  SppRich_s$SRpredScaled <- nrow(subset(tmpdat, abundPredScaled > 0))
+  Prey_SppRich <- data.frame(rbind(Prey_SppRich, SppRich_s))
+  rm(SppRich_s, tmpdat)	}
+#cor(Prey_SppRich$SRobs, Prey_SppRich$SRpredScaled) 
+
+
+
+#----- Remove unnecessary objects -----#
+.keep <- c("Prey_ECCmodel", "Prey_abundModel", "Prey_ECC", "Prey_abundMatrix", "Prey_mean_site_rho",
+  "Prey_SppRich")
+.prey_created <- setdiff(ls(), .prey_before)
+rm(list = setdiff(.prey_created, .keep))
+rm(.prey_before, .prey_created, .keep)
+
+
+
+
+
+
+
+######################### PREDATOR MODEL-FITTING ##################################################
+.predator_before <- ls() # snapshot of current model objects
+abundCutoff <- abundCutoff_predator
+sppdat <- dat2
+traits_df <- traits_df2
+spplist <- predspplist
+sitelist0 <- predsitelist
+
+
+# Empty dataframes to store results
+Pred_ECC <- data.frame(siteHabitat = character(0), ECCobs = numeric(0), ECCpred = numeric(0))
+Pred_SppRich <- data.frame(siteHabitat = character(0), SRobs = numeric(0), SRpredRaw = numeric(0), SRpredScaled = numeric(0))
+Pred_abundMatrix <- data.frame(siteHabitat = character(0), species = character(0), abundObs = numeric(0), 
+  abundPredRaw = numeric(0), abundPredRel = numeric(0), abundPredScaled = numeric(0))
+
+
+# Add prey abundance data to data
+abund_with_size <- merge(Prey_abundMatrix, mammTraits[, c("species", "bodySize")], by = "species", all.x = TRUE)
+prey_abund_by_size <- abund_with_size %>%
+  group_by(siteHabitat, bodySize) %>%
+    summarise(totalAbund = sum(abundPredScaled, na.rm = TRUE), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = bodySize, values_from = totalAbund, values_fill = 0) %>%
+    rename(preySm = small, preyMd = medium, preyLg = large)
+prey_abund_by_size$preySm <- as.numeric(scale(prey_abund_by_size$preySm))
+prey_abund_by_size$preyMd <- as.numeric(scale(prey_abund_by_size$preyMd))
+prey_abund_by_size$preyLg <- as.numeric(scale(prey_abund_by_size$preyLg))
+sppdat <- left_join(sppdat, prey_abund_by_size, by = "siteHabitat")
+
+
+# Prep modeling
+site_abund <- sppdat %>%
+  group_by(siteHabitat) %>%
+  summarize(
+    total_abund = sum(abund, na.rm = TRUE),
+    elevation = first(elevation),
+    tempCV = first(tempCV),
+    tmin = first(tmin),
+    #tmax = first(tmax),
+    precipCV = first(precipCV),
+    precipTotal = first(precipTotal),
+    sradMean = first(sradMean),
+    sweMean = first(sweMean),
+    tree = first(tree),
+    shrub = first(shrub),
+    liana = first(liana),
+    preySm = first(preySm),
+    preyMd = first(preyMd),
+    preyLg = first(preyLg)  )
+mu_site <- log(median(site_abund$total_abund, na.rm = TRUE))
+
+
+
+
+
+
+#----- Environmental carrying capacity (ECC) model; how many indivs (across all spp) a siteHabitat can support -----#
+# View all predictor-vs-response relationships
+predictors <- c("elevation", "tempCV", "tmin", "precipCV", "precipTotal", "sradMean", "sweMean",
+  "tree", "shrub", "liana", "preySm", "preyMd", "preyLg")
+site_abund_long <- site_abund %>%
+  select(total_abund, all_of(predictors)) %>%
+  pivot_longer(cols = -total_abund, names_to = "predictor", values_to = "x")
+ord <- site_abund_long %>%
+  group_by(predictor) %>%
+  summarize(rho = suppressWarnings(cor(x, total_abund, method = "spearman", use = "complete.obs"))) %>%
+  arrange(desc(abs(rho))) %>%
+  pull(predictor)
+site_abund_long$predictor <- factor(site_abund_long$predictor, levels = ord)
+ggplot(site_abund_long, aes(x = x, y = total_abund)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = TRUE) +
+  labs(x = NULL, y = "Total abundance (ECC)") +
+  facet_wrap(~ predictor, scales = "free_x", ncol = 4) +
+  theme_bw()
+# Potentially influential predictors: sweMean [spline 2], sradMean [spline 2], tmin [spline 2] 
+# preyLg [spline 3], preyMd [spline 2], preySm [spline 2], tempCV [spline 2]
+# [preyLg reduced to spline 2 because the interior knots were close to the boundary (0)]
+  
+
+# Global model
+ECCformula <- as.formula("total_abund ~ ns(sweMean, 2) + ns(sradMean, 2) + ns(preyLg, 2) + 
+  ns(preyMd, 2) + ns(preySm, 2) + ns(tempCV, 2) + ns(tmin, 2)")
+ECCmod0 <- brm(
+  formula = ECCformula, family = lognormal(link = "identity"), data = site_abund,
+  prior = c(
+    prior(normal(0, 5), class = "b"),
+    set_prior(paste0("normal(", mu_site, ", 2)"), class = "Intercept"),  
+    prior(exponential(1), class = "sigma")  ),
+  chains = 4, cores = 4, iter = 6000,
+  control = list(adapt_delta = 0.999, max_treedepth = 20))
+#summary(ECCmod0)
+ 
+
+# Subset model 1 - potentially influential predictors
+ECCformula <- as.formula("total_abund ~ ns(preyLg, 2) + ns(preyMd, 2) + ns(tmin, 2)")
+ECCmod1 <- brm(
+  formula = ECCformula, family = lognormal(link = "identity"), data = site_abund,
+  prior = c(
+    prior(normal(0, 5), class = "b"),
+    set_prior(paste0("normal(", mu_site, ", 2)"), class = "Intercept"),  
+    prior(exponential(1), class = "sigma")  ),
+  chains = 4, cores = 4, iter = 6000,
+  control = list(adapt_delta = 0.999, max_treedepth = 20))
+#summary(ECCmod1)
+
+
+# Subset model 1 with gamma distribution
+priors_gamma <- c(
+  prior(normal(0, 1), class = "b"),
+  prior(normal(1.250616, 0.5), class = "Intercept"),  # <-- inline the number
+  prior(exponential(1), class = "shape"))
+ECCmod1gamma <- brm(total_abund ~ ns(preyLg, 2) + ns(preyMd, 2) + ns(tmin, 2),
+  family  = Gamma(link = "log"),
+  data    = site_abund,
+  prior   = priors_gamma,
+  chains  = 4, cores = 4, iter = 6000,
+  control = list(adapt_delta = 0.999, max_treedepth = 20))
+
+
+# Subset model 2 with gamma distribution
+ECCmod2gamma <- brm(total_abund ~ ns(preyMd, 2),
+  family  = Gamma(link = "log"),
+  data    = site_abund,
+  prior   = priors_gamma,
+  chains  = 4, cores = 4, iter = 6000,
+  control = list(adapt_delta = 0.999, max_treedepth = 20))
+
+
+# Compare
+loo_compare(loo(ECCmod0), loo(ECCmod1), loo(ECCmod1gamma), loo(ECCmod2gamma)) 
+
+
+
+
+#----- Trait–environment model; how traits and env together influence abundance -----#
+# Global model
+# Start with same environmental predictors as in the prey global model
+traitTerms <- paste(c("ForStrat.understory", "ForStrat.midhigh", "ForStrat.canopy", "ForStrat.aerial", 
+  "bodyMass", "minAmbTemp", "maxAmbTemp", "minAnnPrecip", "maxAnnPrecip"), collapse = " + ")
+envTerms <- paste(c("elevation", "tmax", "precipTotal", "precipTotal2", "sradMean", "tree", 
+  "shrub"), collapse = " + ") 
+interactionTerms <- paste0("(", traitTerms, ") * (", envTerms, ")")
+interactionTerms <- paste0("(", traitTerms, ") * (", envTerms, ")")
+# Positive-part formula (lognormal)
+abund_formula <- as.formula(paste("abund ~", interactionTerms))
+# Hurdle (zero) part uses the same predictors
+hu_formula    <- as.formula(paste("hu ~", interactionTerms))
+# Prior location for positive part
+mu_abund <- log(median(sppdat$abund[sppdat$abund > 0], na.rm = TRUE))
+# Build bf() with both parts
+abund_bf <- bf(
+  abund_formula,   # positive part
+  hu_formula   )   # hurdle (logit for zero probability)
+start <- Sys.time()
+mod0 <- brm(
+  formula = abund_bf,
+  family  = hurdle_lognormal(link = "identity"),
+  data    = sppdat,
+  prior   = c(
+    # Positive (lognormal) part
+    prior(normal(0, 1), class = "b"),
+    set_prior(paste0("normal(", mu_abund, ", 2)"), class = "Intercept"),
+    prior(exponential(1), class = "sigma"),
+    # Hurdle (zero) part (logit scale)
+    prior(normal(0, 1), class = "b", dpar = "hu"),
+    prior(normal(0, 1), class = "Intercept", dpar = "hu")  ),
+  chains  = 4, cores = 4, iter = 4000,
+  control = list(adapt_delta = 0.999, max_treedepth = 20))
+Sys.time() - start # 39 min
+#summary(mod0); bayes_R2(mod0)
+
+
+# Subset model 1 - predictors that were at least marginal in global model ("marginal" refers to 
+# terms where the posterior mean is away from 0 and the CI just barely overlaps 0. 
+# If an interaction term is included in the model, both main effects also have to be included
+traitTerms <- paste(c("ForStrat.understory"), collapse = " + ")
+envTerms <- paste(c("shrub"), collapse = " + ")
+interactionTerms <- paste(c("ForStrat.understory:shrub"), collapse = " + ")
+all_terms <- paste(c(traitTerms, envTerms, interactionTerms), collapse = " + ")
+abund_formula <- as.formula(paste("abund ~", all_terms))
+# Hurdle (zero) part: no significant/marginal hu terms -> intercept-only
+hu_formula <- as.formula("hu ~ 1")
+# Prior center for positive part
+mu_abund <- log(median(sppdat$abund[sppdat$abund > 0], na.rm = TRUE))
+# Build and fit mod1
+abund_bf <- bf(abund_formula, hu_formula)
+start <- Sys.time()
+mod1 <- brm(
+  formula = abund_bf,
+  family  = hurdle_lognormal(link = "identity"),
+  data    = sppdat,
+  prior   = c(
+    # Positive (lognormal) part
+    prior(normal(0, 1), class = "b"),
+    set_prior(paste0("normal(", mu_abund, ", 2)"), class = "Intercept"),
+    prior(exponential(1), class = "sigma"),
+    # Hurdle (zero) part (intercept-only)
+    prior(normal(0, 1), class = "Intercept", dpar = "hu")  ),
+  chains  = 4, cores = 4, iter = 4000,
+  control = list(adapt_delta = 0.999, max_treedepth = 20))
+Sys.time() - start # 1.7 min
+#summary(mod1); bayes_R2(mod1)  
+# all coefficients significant, so no need for a further subset model (mod2)
+
+
+# Compare models
+loo_compare(loo(mod0), loo(mod1))
+
+
+
+
+
+
+
+######################### PREDATOR MODEL PREDICTIONS #############################################
+Predator_ECCmodel <- ECCmod1
+Predator_abundModel <- mod1
+
+
+
+#----- Predicted ECCs across siteHabitats -----#
+allsitesECCobs <- sppdat %>% group_by(siteHabitat) %>% summarise(ECCobs = sum(abund, na.rm = T), .groups = "drop")
+sitelist <- left_join(sitelist0, allsitesECCobs, by = "siteHabitat")
+sppdat_summary <- sppdat %>%
+  group_by(siteHabitat) %>%
+  summarise(
+    elevation = mean(elevation, na.rm = TRUE),
+    tempCV = mean(tempCV, na.rm = TRUE),
+    tmin = mean(tmin, na.rm = TRUE),
+    tmax = mean(tmax, na.rm = TRUE),
+    precipCV = mean(precipCV, na.rm = TRUE),
+    precipTotal = mean(precipTotal, na.rm = TRUE),
+    precipTotal2 = mean(precipTotal2, na.rm = TRUE),
+    sradMean = mean(sradMean, na.rm = TRUE),
+    sweMean = mean(sweMean, na.rm = TRUE),
+    tree = mean(tree, na.rm = TRUE),
+    shrub = mean(shrub, na.rm = TRUE),
+    liana = mean(liana, na.rm = TRUE),
+    tmin_orig = mean(tmin_orig, na.rm = T),
+    tmax_orig = mean(tmax_orig, na.rm = T),
+    precipTotal_orig = mean(precipTotal_orig, na.rm = T),
+    preyLg = mean(preyLg, na.rm = TRUE),
+    preyMd = mean(preyMd, na.rm = TRUE),
+    preySm = mean(preySm, na.rm = TRUE),
+    .groups = "drop"  )
+sppdat_capacity <- fitted(Predator_ECCmodel, newdata = sppdat_summary)[, "Estimate"]
+names(sppdat_capacity) <- sppdat_summary$siteHabitat
+sppdat_ECC <- data.frame(siteHabitat = names(sppdat_capacity),
+  ECCpredRaw = as.numeric(sppdat_capacity), row.names = NULL, stringsAsFactors = FALSE)
+sitelist <- left_join(sitelist, sppdat_ECC, by = "siteHabitat")
+sitelist$ECCpred <- ifelse(sitelist$ECCpredRaw > max(sitelist$ECCobs, na.rm = T), 
+  max(sitelist$ECCobs, na.rm = T), sitelist$ECCpredRaw)
+sitelist$ECCpred <- ifelse(sitelist$ECCpred < min(sitelist$ECCobs, na.rm = T), 
+  min(sitelist$ECCobs, na.rm = T), sitelist$ECCpred)
+#cor(sitelist$ECCobs, sitelist$ECCpred)
+#cor(sitelist$ECCpredRaw, sitelist$ECCpred)
+# Manually restricting ECCpred to be within the range of ECCobs not needed here (ECCpredRaw and ECCpred are identical) 
+Predator_ECC <- sitelist
+
+
+
+
+#----- Predicted abundance from trait-environment model -----#
+pred_grid <- expand.grid(siteHabitat = sitelist$siteHabitat, species = spplist$species, stringsAsFactors = FALSE)
+pred_grid <- left_join(pred_grid, sppdat_summary, by = "siteHabitat")
+pred_grid <- left_join(pred_grid, traits_df,      by = "species")
+
+# observed abundance
+obs_df <- sppdat %>% select(siteHabitat, species, abund) %>% rename(abundObs = abund)
+pred_grid <- left_join(pred_grid, obs_df, by = c("siteHabitat", "species"))
+pred_grid$abundObs[is.na(pred_grid$abundObs)] <- 0
+
+# posterior predictive draws from the hurdle model (on response scale; includes exact zeros)
+set.seed(123)
+pp_draws <- posterior_predict(Predator_abundModel, newdata = pred_grid, ndraws = 2000)
+
+# median point prediction per row (can be exactly 0)
+pred_grid$abundPredRaw <- apply(pp_draws, 2, stats::median)
+
+# optional diagnostics: probability of zero and a CI
+pred_grid$p_zero   <- colMeans(pp_draws == 0)
+pred_grid$pred_q10 <- apply(pp_draws, 2, stats::quantile, probs = 0.10)
+pred_grid$pred_q90 <- apply(pp_draws, 2, stats::quantile, probs = 0.90)
+rm(pp_draws); invisible(gc())
+
+# predicted relative and absolute ("scaled") abundance
+tmpAbund <- data.frame(siteHabitat = character(0), species = character(0), 
+  abundPredRel = numeric(0), abundPredScaled = numeric(0))
+maxAbund <- max(sppdat$abund, na.rm = T)
+for(s in 1:nrow(sitelist)){
+  #s=1
+  siteHabitat_s <- sitelist$siteHabitat[s]
+  tmpdat <- subset(pred_grid, siteHabitat == siteHabitat_s)
+  ECC_s <- sitelist$ECCpred[sitelist$siteHabitat == siteHabitat_s]
+
+  # Constrain the raw (absolute) abundance predictions
+  tmpdat$minAmbTemp_corr <- tmpdat$minAmbTemp_orig - minTempCorrection
+  tmpdat$maxAmbTemp_corr <- tmpdat$maxAmbTemp_orig + maxTempCorrection
+  tmpdat$abundAdjusted <- ifelse(tmpdat$minAmbTemp_corr > tmpdat$tmin_orig, 0, tmpdat$abundPredRaw)
+    # if min env temperature (tmin_orig) < the species' minimal thermal tolerance (minAmbTemp_orig), set abundAdjustedto 0
+  tmpdat$abundAdjusted <- ifelse(tmpdat$maxAmbTemp_corr < tmpdat$tmax_orig, 0, tmpdat$abundAdjusted)
+    # if max env temperature (tmax_orig) > the species' max thermal tolerance (maxAmbTemp_orig), set abundAdjustedto 0
+  tmpdat$abundAdjusted <- ifelse(!(tmpdat$precipTotal_orig >= tmpdat$minAnnPrecip_orig &
+    tmpdat$precipTotal_orig <= tmpdat$maxAnnPrecip_orig), 0, tmpdat$abundAdjusted)
+    # if precipTotal_orig (env condition) is outside the range of species' precip tolerances (minAnnPrecip_orig : maxAnnPrecip_orig, set abundAjusted to 0
+  tmpdat$abundAdjusted <- ifelse(tmpdat$abundAdjusted <= abundCutoff, 0, tmpdat$abundAdjusted) # abund has to be greater than the (user-defined) cutoff
+  tmpdat$abundAdjusted <- ifelse(tmpdat$abundAdjusted > maxAbund, maxAbund, tmpdat$abundAdjusted) # abund has to be less than the max observed abundance
+  #tmp <- subset(tmpdat, select = c(minAmbTemp_corr, tmin_orig, maxAmbTemp_corr, tmax_orig, 
+  #  minAnnPrecip_orig, maxAnnPrecip_orig, precipTotal_orig, abundPredRaw, abundAdjusted))
+
+  # Calculate predicted relative abundance (sums to 1)
+  total <- sum(tmpdat$abundAdjusted, na.rm = TRUE)
+  if (total > 0) {tmpdat$abundPredRel <- tmpdat$abundAdjusted / total} else {tmpdat$abundPredRel <- tmpdat$abundAdjusted * 0}
+
+  # Calculate predicted absolute abundance (sums to predicted ECC)
+  tmpdat$abundPredScaled <- tmpdat$abundPredRel * ECC_s
+  tmpAbund_s <- subset(tmpdat, select = c(siteHabitat, species, abundPredRel, abundPredScaled))
+  tmpAbund <- data.frame(rbind(tmpAbund, tmpAbund_s))
+  rm(siteHabitat_s, tmpdat, ECC_s, total, tmpAbund_s)	}
+abundMatrix <- left_join(pred_grid, tmpAbund, by = c("siteHabitat", "species"))
+Predator_abundMatrix <- subset(abundMatrix, select = c(siteHabitat, species, abundObs, abundPredRaw, abundPredScaled))
+
+
+# Evaluate predictions using mean site-wise Spearman ρ between observed and predicted relative abundances
+# i.e., Within each site, how well do predicted vs observed species compositions agree?
+safe_spearman <- function(x, y, min_n = 3) { # Helper: safe Spearman that returns NA instead of error
+  ok <- is.finite(x) & is.finite(y)
+  if (sum(ok) < min_n) return(NA_real_)
+  x <- x[ok]; y <- y[ok]
+  if (sd(x) == 0 || sd(y) == 0) return(NA_real_)
+  suppressWarnings(cor(x, y, method = "spearman"))}
+site_rho <- Predator_abundMatrix %>%
+  group_by(siteHabitat) %>%
+  mutate(
+    obs_sum  = sum(abundObs, na.rm = TRUE),
+    pred_sum = sum(abundPredScaled, na.rm = TRUE),
+    obs_rel  = ifelse(obs_sum  > 0, abundObs        / obs_sum,  NA_real_),
+    pred_rel = ifelse(pred_sum > 0, abundPredScaled / pred_sum, NA_real_)
+  ) %>%
+  # keep species that contribute to at least one composition
+  filter((obs_rel > 0) | (pred_rel > 0)) %>%
+  summarise(
+    n_complete = sum(is.finite(obs_rel) & is.finite(pred_rel)),
+    rho = safe_spearman(obs_rel, pred_rel),
+    .groups = "drop"  )
+Predator_mean_site_rho <- mean(site_rho$rho, na.rm = TRUE)
+# sum(is.finite(site_rho$rho)) # How many sites contributed a finite rho?
+
+
+
+
+#----- Species richness -----#
+Predator_SppRich <- data.frame(siteHabitat = character(0), SRobs = numeric(0), 
+  SRpredRaw = numeric(0), SRpredScaled = numeric(0))
+for(s in 1:nrow(sitelist)){
+  #s=1
+  SppRich_s <- data.frame(siteHabitat = sitelist$siteHabitat[s], SRobs = NA, SRpredRaw = NA, SRpredScaled = NA)  
+  tmpdat <- subset(Predator_abundMatrix, siteHabitat == sitelist$siteHabitat[s])
+  SppRich_s$SRobs <- nrow(subset(tmpdat, abundObs > 0))
+  SppRich_s$SRpredRaw <- nrow(subset(tmpdat, abundPredRaw > 0))
+  SppRich_s$SRpredScaled <- nrow(subset(tmpdat, abundPredScaled > 0))
+  Predator_SppRich <- data.frame(rbind(Predator_SppRich, SppRich_s))
+  rm(SppRich_s, tmpdat)	}
+#cor(Predator_SppRich$SRobs, Predator_SppRich$SRpredScaled) 
+
+
+
+
+#----- Remove unnecessary objects -----#
+#.keep <- c("Predator_ECCmodel", "Predator_abundModel", "Predator_ECC", "Predator_abundMatrix", 
+#  "Predator_mean_site_rho", "Predator_SppRich")
+#.predator_created <- setdiff(ls(), .predator_before)
+#rm(list = setdiff(.predator_created, .keep))
+#rm(.predator_before, .predator_created, .keep)
+
+
+
+
+
+
+
+######################### WRAP UP #############################################################
+# Table of some key results
+c_ecc_prey  <- cor(Prey_ECC$ECCobs, Prey_ECC$ECCpred, use = "complete.obs")
+c_sr_prey   <- cor(Prey_SppRich$SRobs, Prey_SppRich$SRpredScaled, use = "complete.obs")
+c_ecc_pred  <- cor(Predator_ECC$ECCobs, Predator_ECC$ECCpred, use = "complete.obs")
+c_sr_pred   <- cor(Predator_SppRich$SRobs, Predator_SppRich$SRpredScaled, use = "complete.obs")
+vals <- c(c_ecc_prey, Prey_mean_site_rho, c_sr_prey, c_ecc_pred, Predator_mean_site_rho, c_sr_pred)
+vals <- round(vals, 2)
+restable <- data.frame(t(matrix(vals, nrow = 2, byrow = TRUE)))
+restable
+
+
+#save.image(file = "MS Community assembly/Analysis/Results/workspace_250904.RData")
+
+
+
+
+
+
+
+
+
+
+
+
+#########################################################################################################
+################## END OF CODE ##########################################################################
+#########################################################################################################
+
+
+
+

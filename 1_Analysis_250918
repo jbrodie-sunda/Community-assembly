@@ -1,0 +1,845 @@
+
+
+###################################################################################################
+# Loops through each NEON site, running separate continuous-time differential equation models to assess how
+# the abundance of small mammal species is affected by:
+# (i) climate
+# (ii) 'drift' (akin to density dependence)
+# (iii) potential competitors
+# We're leaving out predators here. The NEON bird data are just too sparse (see 1_Analysis_2504280.R)
+#
+# Analysis notes:
+# (1) Continuous-time SEMs to estimate bi-directional interactions
+# (2) Species associations are constrained to be negative, as per competition, with a prior mean based on the trait-distance
+#   between the species (ie more similar species are expected to have greater negative effects on each other)
+#
+# Other notes:
+#  -Spatial sampling unit is the siteHabitat
+#  -Temporal sampling is monthly; we take the average (across plots within each siteHabitat) abundance
+#   for each month. An alternative approach would have been to use the first "sampling date" as the time unit, 
+#   but different plots within each siteHabitat could have been sampled at different times, which could have
+#   introduced a lot of noise
+###################################################################################################
+
+
+
+
+
+library(tidyverse)
+library(lubridate)
+library(rstan)
+library(ctsem)
+library(qgraph)
+library(expm)
+library(igraph)
+library(bridgesampling)
+
+
+
+
+setwd('C:/Users/Jedediah.Brodie/OneDrive - The University of Montana/Projects (active)/AngieDeanYlva/NEON project')
+
+
+
+
+
+
+
+######################### DATA ###############################################################
+# Load data
+rm(list = ls())
+mammclim <- data.frame(read.csv("MS Association network/Analysis/Data/Intermed/smammals_and_climate.csv", header = T))
+traits0  <- data.frame(read.csv("NEON data/NEON Smammals/SmammalTraitData.csv", header = T))
+climdat  <- data.frame(read.csv("NEON data/NEON Ecology Files/Climate_by_siteHabitat_monthly_means_2013_2023.csv", header = T))
+
+
+# Clean and format mammal data
+mammdat <- subset(mammclim, !is.na(nlcdClass))
+mammdat$genus <- gsub(" .*", "", mammdat$species)
+mammdat <- mammdat %>% mutate(
+  first.date_clean = ymd(first.date_clean),
+  year = year(first.date_clean),
+  month = month(first.date_clean))
+names(mammdat)[names(mammdat) == "first.date_clean"] <- "startDate"
+names(mammdat)[names(mammdat) == "N.est"] <- "abund"
+names(mammdat)[names(mammdat) == "N.est_lower"] <- "abund_lo"
+names(mammdat)[names(mammdat) == "N.est_upper"] <- "abund_hi"
+mammdat <- subset(mammdat, select = c(siteHabitat, plotID, species, genus, startDate, year, month, abund, 
+  abund_lo, abund_hi))
+
+
+# Deal with taxonomic ambiguity & formatting
+mammdat$species <- gsub("sp.", "sp", mammdat$species)
+mammdat <- mammdat[!grepl(" sp$", mammdat$species), ]
+mammdat$species <- gsub(" ", "", mammdat$species)
+mammdat$species <- gsub("/.*", "", mammdat$species) # assign ambiguous IDs to the first possibility
+mammdat$species <- ifelse(str_detect(mammdat$species, "^Mustela "), "Mustela sp", mammdat$species)
+
+
+# Correct some mis-spellings & taxonomy
+mammdat$species[mammdat$species == "Tamiasspciosus"] <- "Tamiasspeciosus"
+mammdat$species[mammdat$species == "Microtuspnetorum"] <- "Microtuspinetorum"
+mammdat$species[mammdat$species == "Microtuspnnsylvanicus"] <- "Microtuspennsylvanicus"
+mammdat$species[mammdat$species == "Alexandromysoeconomus"] <- "Microtusoeconomus"
+mammdat$species[mammdat$species == "Sigmodonhispdus"] <- "Sigmodonhispidus"
+mammdat$species[mammdat$species == "Chaetodipushispdus"] <- "Chaetodipushispidus"
+mammdat$species[mammdat$species == "Ictidomystridecemlineatus"] <- "Spermophilustridecemlineatus"
+mammdat$species[mammdat$species == "Zapuspinceps"] <- "Zapusprinceps"
+mammdat$species[mammdat$species == "Oryzomysplustris"] <- "Oryzomyspalustris"
+mammdat$species[mammdat$species == "Peromyscusplionotus"] <- "Peromyscuspolionotus"
+mammdat$species[mammdat$species == "Chaetodipuspnicillatus"] <- "Chaetodipuspenicillatus"
+mammdat$species[mammdat$species == "Dipodomysspctabilis"] <- "Dipodomysspectabilis"
+mammdat$species[mammdat$species == "Perognathusprvus"] <- "Perognathusparvus"
+mammdat$species[mammdat$species == "Ammosprmophilusleucurus"] <- "Ammospermophilusleucurus"
+mammdat$species[mammdat$species == "Callosprmophiluslateralis"] <- "Spermophiluslateralis"
+mammdat$species[mammdat$species == "Ammosprmophilusharrisii"] <- "Ammospermophilusharrisii"
+mammdat$species[mammdat$species == "Spermophilusprryii"] <- "Spermophilusparryii"
+mammdat$species[mammdat$species == "Spermophilussplosoma"] <- "Spermophilusspilosoma"
+mammdat$genus[mammdat$genus == "Alexandromys"] <- "Microtus"
+mammdat$genus[mammdat$genus == "Ictidomys"] <- "Spermophilus"
+mammdat$genus[mammdat$genus == "Ammosprmophilus"] <- "Spermophilus"
+mammdat$genus[mammdat$genus == "Callosprmophilus"] <- "Spermophilus"
+mammdat$genus[mammdat$genus == "Callospermophilus"] <- "Spermophilus"
+
+
+# Filter mammal taxa
+mammdat <- subset(mammdat, genus != "Mustela")
+mammdat <- subset(mammdat, genus != "Sorex")
+mammdat <- subset(mammdat, genus != "Blarina")
+mammdat <- subset(mammdat, genus != "Cryptotis")
+mammdat <- subset(mammdat, genus != "Notiosorex")
+mammdat <- subset(mammdat, genus != "Megasorex")
+mammdat <- subset(mammdat, genus != "Scapanus")
+
+
+# Group into siteHabitats
+mammdat <- mammdat %>% group_by(siteHabitat, year, month, species) %>%
+  summarise(
+    genus    = first(genus),
+    abund    = mean(abund, na.rm = TRUE),
+    abund_hi = mean(abund_hi, na.rm = TRUE),
+    abund_lo = mean(abund_lo, na.rm = TRUE),
+    .groups  = "drop"  )
+mammdat <- data.frame(mammdat) # I fucking hate tibbles
+
+
+#  Link to climate data (standardized across siteHabitat-year-months)
+siteHabs <- mammdat %>% dplyr::distinct(siteHabitat, year, month)
+siteHabs <- data.frame(left_join(siteHabs, climdat, by = c("siteHabitat", "year", "month")))
+m1 <- mean(siteHabs$tempMean, na.rm = TRUE); s1 <- sd(siteHabs$tempMean, na.rm = TRUE)
+m2 <- mean(siteHabs$precipTotal, na.rm = TRUE); s2 <- sd(siteHabs$precipTotal, na.rm = TRUE)
+m3 <- mean(siteHabs$sweMean, na.rm = TRUE); s3 <- sd(siteHabs$sweMean, na.rm = TRUE)
+siteHabs$tempMean <- ((siteHabs$tempMean) - m1) / s1
+siteHabs$precipTotal <- ((siteHabs$precipTotal) - m2) / s2
+siteHabs$sweMean <- ((siteHabs$sweMean) - m3) / s3
+dat <- left_join(mammdat, siteHabs, by = c("siteHabitat", "year", "month"))
+dat <- subset(dat, select = -c(abund_hi, abund_lo))
+
+
+# Clean trait data (standardized across species)
+traits <- subset(traits0, select = c(Scientific, Diet.Inv, Diet.Vend, Diet.Vect, Diet.Vfish, Diet.Scav,
+  Diet.Fruit, Diet.Nect, Diet.Seed, Diet.PlantO, adult_body_mass_g))
+names(traits)[names(traits) == "Scientific"] <- "species"
+names(traits)[names(traits) == "Diet.PlantO"] <- "Diet.Herb"
+names(traits)[names(traits) == "adult_body_mass_g"] <- "bodyMass"
+traits$species <- gsub(" ", "", traits$species)
+trait_cols <- setdiff(names(traits), c("species"))
+traitsNum <- traits[ , trait_cols]
+for (jj in seq_along(trait_cols)) {
+  v <- traitsNum[[jj]]
+  if (anyNA(v)) traitsNum[[jj]] <- if (is.numeric(v)) replace(v, is.na(v), mean(v, na.rm=TRUE)) else v}
+traitsStd <- traits
+traitsStd[ , trait_cols] <- scale(traitsNum)
+trait_values <- traitsStd[ , trait_cols]
+
+
+# A trait-distance table
+trait_dist <- dist(trait_values, method = "euclidean")
+traitTable <- data.frame(as.matrix(trait_dist))
+rownames(traitTable) <- colnames(traitTable) <- traitsStd$species
+
+
+# Create species and site lists
+spplist <- data.frame(species = unique(dat$species))
+sitelist <- data.frame(siteHabitat = unique(dat$siteHabitat))
+
+
+# Empty dataframe to store results 
+res <- sitelist
+res$numspp <- NA
+res$numSppEffects <- NA
+res$numClimEffects <- NA
+res$connectance <- NA
+res$propBadRhat <- NA
+
+
+# Objects that must survive every iteration
+.stuffToKeep <- ls(all.names = TRUE)
+.alwaysKeep  <- c(".stuffToKeep", ".alwaysKeep", "res", "sitelist")  # includes things that mutate each iteration
+
+
+
+
+
+
+
+######################### ANALYSIS ###############################################################
+start <- Sys.time()
+for (i in 71:nrow(sitelist)) {
+  siteHabitat_i <- sitelist$siteHabitat[i]
+  tryCatch({
+  #i=1
+
+
+  # --- Format the data for iteration i --- #
+  # subset the data
+  siteHabitat_i <- sitelist$siteHabitat[i]
+  dat1 <- subset(dat, siteHabitat == siteHabitat_i)
+  spplist_i <- data.frame(species = unique(dat1$species))
+
+  # build mid-month date and time (days since first, per id)
+  dat1$date <- lubridate::make_date(year = dat1$year, month = dat1$month, day = 15)
+  dat1$time <- as.numeric(dat1$date)
+  dat1$id <- as.numeric(as.factor(siteHabitat_i))
+  dat1 <- dat1[order(dat1$id, dat1$date), ]
+  dat1$time <- dat1$time - ave(dat1$time, dat1$id, FUN = min)
+
+  # define the target species for the SEM
+  counts <- sort(table(dat1$species), decreasing = TRUE)
+  #targets <- names(counts)[seq_len(min(4L, length(counts)))] # just the X most abundant species
+  targets <- as.character(spplist_i$species) # all species at siteHabitat i
+
+  # convert data to wide format
+  clim_by_it <- dat1 %>%
+    group_by(id, time) %>%
+    summarise(
+      tempMean = mean(tempMean, na.rm = TRUE),
+      precipTotal = mean(precipTotal, na.rm = TRUE),
+      sweMean = mean(sweMean, na.rm = TRUE), .groups = "drop"    )
+  abund_wide <- dat1 %>%
+    group_by(id, time, species) %>%
+    summarise(abund = mean(abund, na.rm = TRUE), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from  = species, values_from = abund, values_fill = 0    )
+  dat1wide <- clim_by_it %>%
+    left_join(abund_wide, by = c("id","time")) %>%
+    arrange(id, time) %>%
+    as.data.frame()
+  stopifnot(!any(duplicated(dat1wide[c("id","time")])))
+
+  # ensure target species exist as columns; skip if not
+  if (!all(targets %in% names(dat1wide))) {next}
+
+  # restrict the dataset to climate variables + the target species
+  dat1wide <- dat1wide[, c("id", "time", "tempMean", "precipTotal", "sweMean", targets), drop = FALSE]
+
+  # variable sets for this model
+  manifestVars <- sort(targets)
+  latentVars   <- manifestVars
+  TDpredNames  <- c("tempMean", "precipTotal", "sweMean")
+  res$numspp[i] <- length(manifestVars)
+
+
+
+  # --- Model prep --- #
+  # LAMBDA (identity)
+  LAMBDA <- matrix(0, length(manifestVars), length(latentVars),
+    dimnames = list(manifestVars, latentVars))
+  for (sp in manifestVars) LAMBDA[sp, sp] <- 1
+
+  # DRIFT (self + all ordered pairs i!=j)
+  DRIFT <- matrix(0, length(latentVars), length(latentVars),
+    dimnames = list(latentVars, latentVars))
+  for (sp in manifestVars) DRIFT[sp, sp] <- paste0("drift_", sp, "_self")
+  for (to in manifestVars) for (from in setdiff(manifestVars, to)) {
+    DRIFT[to, from] <- paste0("drift_", to, "_", from)}
+
+  # collect labels
+  islabel <- grepl("[A-Za-z]", DRIFT)
+  drift_labels <- unique(DRIFT[islabel])
+
+  # priors: self −0.2±0.2; cross 0±0.5
+  drift_priors <- data.frame(
+    matrix="DRIFT", row=NA_integer_, col=NA_integer_, param=drift_labels,
+    value=NA_real_, priormean=0, priorsd=0.5, stringsAsFactors=FALSE)
+  for (k in seq_along(drift_labels)) {
+    loc <- which(DRIFT == drift_labels[k], arr.ind = TRUE)
+    drift_priors$row[k] <- loc[1,"row"]; drift_priors$col[k] <- loc[1,"col"]}
+  self_idx <- grepl("_self$", drift_priors$param)
+  drift_priors$priormean[self_idx] <- -0.2
+  drift_priors$priorsd[self_idx] <- 0.2
+
+  # trait-distance–based negative shrinkage for all cross-effects
+  if (exists("traitTable") && !is.null(traitTable)) {
+    to_names <- sub("^drift_([^_]+)_.+$", "\\1", drift_priors$param)
+    from_names <- sub("^drift_[^_]+_(.+)$", "\\1", drift_priors$param)
+    cross_idx <- !self_idx &
+      to_names %in% rownames(traitTable) & from_names %in% colnames(traitTable)
+    if (any(cross_idx)) {
+      d <- mapply(function(a,b) traitTable[a,b], to_names[cross_idx], from_names[cross_idx])
+      sim <- exp(-as.numeric(d))
+      drift_priors$priormean[cross_idx] <- -0.3 * sim}} # tweak scale as desired
+
+  # CINT (latent intercepts)
+  CINT <- matrix(paste0("cint_", latentVars), nrow = length(latentVars), ncol = 1,
+    dimnames = list(latentVars, "intercept"))
+  cint_priors <- data.frame(
+    matrix="CINT", row=seq_along(latentVars), col=1L,
+    param=paste0("cint_", latentVars),
+    value=NA_real_, priormean=0, priorsd=1, stringsAsFactors=FALSE)
+
+  # T0VAR (fix to identity because we're modeling each siteHabitat separately)
+  T0VAR <- diag(1, length(latentVars))
+  rownames(T0VAR) <- colnames(T0VAR) <- latentVars
+
+  # MANIFESTVAR (measurement error, diagonal free)
+  MANIFESTVAR <- matrix(0, length(manifestVars), length(manifestVars),
+    dimnames=list(manifestVars, manifestVars))
+  for (sp in manifestVars) MANIFESTVAR[sp, sp] <- paste0("mvar_", sp)
+  mvar_priors <- data.frame(
+    matrix="MANIFESTVAR", row=seq_along(manifestVars), col=seq_along(manifestVars),
+    param=paste0("mvar_", manifestVars),
+    value=NA_real_, priormean=0.5, priorsd=0.25, stringsAsFactors=FALSE)
+
+  # MANIFESTMEANS (fix to 0)
+  MANIFESTMEANS <- matrix(0, nrow=length(manifestVars), ncol=1,
+    dimnames=list(manifestVars, "mean"))
+
+  # T0MEANS (initial latent means)
+  T0MEANS <- matrix(paste0("t0mean_", latentVars), nrow=length(latentVars), ncol=1,
+    dimnames=list(latentVars, "mean"))
+  t0means_priors <- data.frame(
+    matrix="T0MEANS", row=seq_along(latentVars), col=1L,
+    param=paste0("t0mean_", latentVars),
+    value=NA_real_, priormean=0, priorsd=1, stringsAsFactors=FALSE)
+
+  # DIFFUSION (process noise, diagonal free)
+  DIFFUSION <- matrix(0, length(latentVars), length(latentVars),
+    dimnames=list(latentVars, latentVars))
+  for (lv in latentVars) DIFFUSION[lv, lv] <- paste0("diff_", lv)
+  diff_priors <- data.frame(
+    matrix="DIFFUSION", row=seq_along(latentVars), col=seq_along(latentVars),
+    param=paste0("diff_", latentVars),
+    value=NA_real_, priormean=0.5, priorsd=0.25, stringsAsFactors=FALSE)
+
+  # TDPREDEFFECT (effects of observed climate -> species)
+  TDPREDEFFECT <- matrix(0, nrow=length(latentVars), ncol=length(TDpredNames),
+    dimnames=list(latentVars, TDpredNames))
+  for (sp in manifestVars) {
+    TDPREDEFFECT[sp, "tempMean"]    <- paste0("beta_", sp, "_temp")
+    TDPREDEFFECT[sp, "precipTotal"] <- paste0("beta_", sp, "_precip")
+    TDPREDEFFECT[sp, "sweMean"]     <- paste0("beta_", sp, "_swe")}
+  td_beta_labels <- as.vector(TDPREDEFFECT[grepl("[A-Za-z]", TDPREDEFFECT)])
+  td_beta_priors <- data.frame(
+    matrix="TDPREDEFFECT",
+    row = match(sub("^beta_(.+)_(temp|precip|swe)$","\\1", td_beta_labels), latentVars),
+    col = match(sub("^beta_.+_(temp|precip|swe)$","\\1", td_beta_labels),
+      c(temp="tempMean", precip="precipTotal", swe="sweMean")),
+      param=td_beta_labels,
+      value=NA_real_, priormean=0, priorsd=0.5, stringsAsFactors=FALSE)
+
+
+
+  # --- Build and run the model --- #
+  # specify structure
+  modelStructure <- ctModel(
+    LAMBDA = LAMBDA,
+    type = "stanct",
+    n.manifest = length(manifestVars),
+    n.latent   = length(latentVars),
+    manifestNames = manifestVars,
+    latentNames   = latentVars,
+    T0VAR = T0VAR,
+    MANIFESTVAR = MANIFESTVAR,
+    DRIFT = DRIFT,
+    CINT  = CINT,
+    MANIFESTMEANS = MANIFESTMEANS,
+    T0MEANS = T0MEANS,
+    DIFFUSION = DIFFUSION,
+    n.TDpred = length(TDpredNames),
+    TDpredNames = TDpredNames,
+    TDPREDEFFECT = TDPREDEFFECT)
+
+  # attach priors
+  priors_all <- rbind(drift_priors, cint_priors, mvar_priors, t0means_priors, diff_priors, td_beta_priors)
+  priors_all$value <- NA_real_
+  modelStructure$pars <- dplyr::left_join(
+    modelStructure$pars,
+    priors_all[, c("param","priormean","priorsd")],
+    by = "param")
+
+  # ensure ctsem column names
+  if ("priormean" %in% names(modelStructure$pars)) {
+    names(modelStructure$pars)[match(c("priormean","priorsd"), names(modelStructure$pars))] <- c("priorMean","priorSD")}
+
+  # species effects on each other constrained to be negative or zero (all off-diagonal DRIFT ≤ 0)
+  pairs <- expand.grid(to = manifestVars, from = manifestVars, stringsAsFactors = FALSE)
+  pairs <- pairs[pairs$to != pairs$from, ]
+  bounds_df <- data.frame(param = paste0("drift_", pairs$to, "_", pairs$from), upper = 0)
+  modelStructure$pars <- dplyr::left_join(modelStructure$pars, bounds_df, by = "param")
+
+  # set some Bayesian modelling parameters
+  iter <- 3000 
+  warmup <- 500
+  chains <- 3
+
+  # fit model
+  start2 <- Sys.time()
+  mod1 <- ctStanFit(
+    datalong = dat1wide, 
+    ctstanmodel = modelStructure,
+    iter = iter,
+    warmup = warmup,
+    chains = chains,
+    cores = 'maxneeded',
+    optimize = FALSE,
+    priors = TRUE)
+  Sys.time() - start2 # 29 min
+
+
+
+  # --- Model diagnostics --- #
+  sfit <- mod1$stanfit$stanfit
+  sumtab <- rstan::summary(sfit)$summary
+  rhat <- sumtab[, "Rhat"]
+  rn <- rownames(sumtab)
+  rhatDrift <- rhat[grepl("^pop_DRIFT\\[", rn, perl = TRUE)]
+  propBadRhat <- mean(rhatDrift > 1.05, na.rm = TRUE)
+  #cat("n DRIFT params:", length(rhatDrift), "\n")
+  #cat("propBadRhat (DRIFT):", propBadRhat, "\n")
+
+
+
+  # --- Model results --- #
+  # extract significant drift coefficients (intra- and inter-specific effects)
+  sem_summary <- summary(mod1)$popmeans
+  semCoef <- data.frame(
+    parameter = rownames(sem_summary),
+    estimate  = sem_summary[, "mean"],
+    lower     = sem_summary[, "2.5%"],
+    upper     = sem_summary[, "97.5%"],
+    stringsAsFactors = FALSE)
+  if ("sd" %in% colnames(sem_summary)) {
+    semCoef$se <- sem_summary[, "sd"]} else {
+    # fallback: approximate SE from 95% CI width
+  semCoef$se <- (semCoef$upper - semCoef$lower) / 3.92}
+  sigDrift <- semCoef %>%
+    dplyr::filter(grepl("^drift_", parameter)) %>%
+    dplyr::mutate(
+      is_self = grepl("_self$", parameter),
+      sig = ifelse(is_self, !(lower <= 0 & upper >= 0), upper < 0) # self: two-sided; cross: one-sided
+    ) %>% dplyr::filter(sig) %>% dplyr::select(-is_self, -sig)
+  from <- to <- character(nrow(sigDrift))
+  for (j in seq_len(nrow(sigDrift))) {
+    parts <- strsplit(sigDrift$parameter[j], "_")[[1]]
+    to[j]   <- parts[2]
+    from[j] <- parts[3]}
+  sigDrift$to <- to
+  sigDrift$from <- from
+
+  # extract climate (TD predictor) effects: beta_{species}_{temp|precip|swe}
+  td_all <- semCoef %>%
+    dplyr::filter(grepl("^beta_", parameter)) %>%
+    dplyr::mutate(
+      species = sub("^beta_([^_]+)_.+$", "\\1", parameter),
+      predcode = sub("^beta_[^_]+_(.+)$", "\\1", parameter),
+      predictor = dplyr::recode(predcode,
+        temp   = "tempMean",
+        precip = "precipTotal",
+        swe    = "sweMean"),
+      sig = !(lower <= 0 & upper >= 0)) %>%
+    dplyr::select(species, predictor, estimate, se, lower, upper, parameter, sig)
+  drift_all <- semCoef %>%
+    dplyr::filter(grepl("^drift_", parameter)) %>%
+    dplyr::mutate(
+      to       = sub("^drift_([^_]+)_.+$", "\\1", parameter),
+      from_raw = sub("^drift_[^_]+_(.+)$", "\\1", parameter),
+      from     = ifelse(from_raw == "self", to, from_raw),
+      is_self  = (from_raw == "self"),
+      sig      = ifelse(is_self, !(lower <= 0 & upper >= 0), upper < 0),  # one-sided for cross (≤0 constraint)
+      type     = "drift"  ) %>%
+    dplyr::select(from, to, estimate, se, lower, upper, is_self, sig, type)
+  clim_all <- td_all %>% dplyr::transmute(
+    from    = predictor,
+    to      = species,
+    estimate, se, lower, upper,
+    is_self = FALSE,
+    sig     = sig,
+    type    = "climate")
+
+  # combined coefficients (significant only)
+  sigEdges <- dplyr::bind_rows(
+    drift_all %>% dplyr::filter(sig),
+    clim_all  %>% dplyr::filter(sig))
+  sigEdges$type <- as.character(sigEdges$type)  # avoid factor level issues
+  sigEdges$type <- dplyr::case_when(
+    sigEdges$is_self ~ "self",
+    sigEdges$type == "drift" ~ "competition",
+    TRUE ~ sigEdges$type)
+  sigEdges <- subset(sigEdges, select = -c(is_self, sig))
+
+
+
+  # --- Subset model --- #
+  # parameter labels to keep, derived from sigEdges
+  sigEdges2 <- sigEdges %>%
+    dplyr::mutate(
+      type = dplyr::case_when(
+        from %in% c("tempMean","precipTotal","sweMean") ~ "climate",
+        from == to ~ "self",
+        TRUE ~ "competition"    )  )
+  keep_drift <- with(subset(sigEdges2, type != "climate"), ifelse(from == to,
+    paste0("drift_", to, "_self"),
+    paste0("drift_", to, "_", from)))
+  keep_beta <- with(subset(sigEdges2, type == "climate"), paste0("beta_", to, "_",
+    dplyr::recode(from, tempMean = "temp", precipTotal= "precip", sweMean    = "swe")))
+  keep_params <- unique(c(keep_drift, keep_beta))
+
+  # zero-out non-kept entries in the mod1 matrices (keep others as-is)
+  DRIFT2 <- DRIFT
+  DRIFT2[grepl("^drift_", DRIFT2) & !(DRIFT2 %in% keep_params)] <- 0
+  TDPREDEFFECT2 <- TDPREDEFFECT
+  TDPREDEFFECT2[grepl("^beta_", TDPREDEFFECT2) & !(TDPREDEFFECT2 %in% keep_params)] <- 0
+
+  # build the reduced model (reusing all other matrices)
+  modelStructure2 <- ctModel(
+    LAMBDA = LAMBDA, type = "stanct",
+    n.manifest = length(manifestVars),
+    n.latent   = length(latentVars),
+    manifestNames = manifestVars,
+    latentNames   = latentVars,
+    T0VAR = T0VAR, MANIFESTVAR = MANIFESTVAR,
+    DRIFT = DRIFT2, CINT = CINT,
+    MANIFESTMEANS = MANIFESTMEANS, T0MEANS = T0MEANS,
+    DIFFUSION = DIFFUSION,
+    n.TDpred = length(TDpredNames), TDpredNames = TDpredNames,
+    TDPREDEFFECT = TDPREDEFFECT2)
+
+  # attach priors (only those that still exist in model2)
+  priors_all2 <- rbind(
+    subset(drift_priors, param %in% keep_params),
+    cint_priors, mvar_priors, t0means_priors, diff_priors,
+    subset(td_beta_priors, param %in% keep_params))
+  priors_all2$value <- NA_real_
+  modelStructure2$pars <- dplyr::left_join(
+    modelStructure2$pars,
+    priors_all2[, c("param","priormean","priorsd")],
+    by = "param")
+  if ("priormean" %in% names(modelStructure2$pars)) {
+    names(modelStructure2$pars)[match(c("priormean","priorsd"), names(modelStructure2$pars))] <-
+      c("priorMean","priorSD")}
+
+  # bounds: only cross-species drifts (no self, no climate)
+  if ("upper" %in% names(modelStructure2$pars)) modelStructure2$pars$upper <- NULL
+  pairs <- expand.grid(to = manifestVars, from = manifestVars, stringsAsFactors = FALSE)
+  pairs <- subset(pairs, to != from)
+  bounds_df2 <- transform(pairs,
+    param = paste0("drift_", to, "_", from),
+    upper = 0)[, c("param","upper")]
+  bounds_df2 <- subset(bounds_df2, param %in% keep_params)
+  modelStructure2$pars <- dplyr::left_join(modelStructure2$pars, bounds_df2, by = "param")
+
+  # fit mod2 (same settings as mod1)
+  start2 <- Sys.time()
+  mod2 <- ctStanFit(datalong = dat1wide, ctstanmodel = modelStructure2, iter = iter, warmup = warmup, 
+    chains = chains, cores = 'maxneeded', optimize = FALSE, priors = TRUE)
+  Sys.time() - start2 # 5 min
+
+  # compare to mod1
+  b1 <- bridgesampling::bridge_sampler(mod1$stanfit$stanfit, silent = TRUE)
+  b2 <- bridgesampling::bridge_sampler(mod2$stanfit$stanfit, silent = TRUE)
+  bf12 <- bridgesampling::bf(b1, b2)$bf 
+
+
+
+  # --- If mod2 is best, recalculate model diagnostics and results --- #
+  if(bf12 < 1) {
+  mod1 <- mod2
+
+  # --- Model diagnostics ---
+  sfit <- mod1$stanfit$stanfit
+  sumtab <- rstan::summary(sfit)$summary
+  rhat <- sumtab[, "Rhat"]
+  rn <- rownames(sumtab)
+  rhatDrift <- rhat[grepl("^pop_DRIFT\\[", rn, perl = TRUE)]
+  propBadRhat <- mean(rhatDrift > 1.05, na.rm = TRUE)
+  #cat("n DRIFT params:", length(rhatDrift), "\n")
+  #cat("propBadRhat (DRIFT):", propBadRhat, "\n")
+
+  # model results
+  sem_summary <- summary(mod1)$popmeans
+  semCoef <- data.frame(
+    parameter = rownames(sem_summary),
+    estimate  = sem_summary[, "mean"],
+    lower     = sem_summary[, "2.5%"],
+    upper     = sem_summary[, "97.5%"],
+    stringsAsFactors = FALSE)
+  if ("sd" %in% colnames(sem_summary)) {
+    semCoef$se <- sem_summary[, "sd"]} else {
+    # fallback: approximate SE from 95% CI width
+  semCoef$se <- (semCoef$upper - semCoef$lower) / 3.92}
+  sigDrift <- semCoef %>%
+    dplyr::filter(grepl("^drift_", parameter)) %>%
+    dplyr::mutate(
+      is_self = grepl("_self$", parameter),
+      sig = ifelse(is_self, !(lower <= 0 & upper >= 0), upper < 0) # self: two-sided; cross: one-sided
+    ) %>% dplyr::filter(sig) %>% dplyr::select(-is_self, -sig)
+  from <- to <- character(nrow(sigDrift))
+  for (j in seq_len(nrow(sigDrift))) {
+    parts <- strsplit(sigDrift$parameter[j], "_")[[1]]
+    to[j]   <- parts[2]
+    from[j] <- parts[3]}
+  sigDrift$to <- to
+  sigDrift$from <- from
+
+  # extract climate (TD predictor) effects: beta_{species}_{temp|precip|swe}
+  td_all <- semCoef %>%
+    dplyr::filter(grepl("^beta_", parameter)) %>%
+    dplyr::mutate(
+      species = sub("^beta_([^_]+)_.+$", "\\1", parameter),
+      predcode = sub("^beta_[^_]+_(.+)$", "\\1", parameter),
+      predictor = dplyr::recode(predcode,
+        temp   = "tempMean",
+        precip = "precipTotal",
+        swe    = "sweMean"),
+      sig = !(lower <= 0 & upper >= 0)) %>%
+    dplyr::select(species, predictor, estimate, se, lower, upper, parameter, sig)
+  drift_all <- semCoef %>%
+    dplyr::filter(grepl("^drift_", parameter)) %>%
+    dplyr::mutate(
+      to       = sub("^drift_([^_]+)_.+$", "\\1", parameter),
+      from_raw = sub("^drift_[^_]+_(.+)$", "\\1", parameter),
+      from     = ifelse(from_raw == "self", to, from_raw),
+      is_self  = (from_raw == "self"),
+      sig      = ifelse(is_self, !(lower <= 0 & upper >= 0), upper < 0),  # one-sided for cross (≤0 constraint)
+      type     = "drift"  ) %>%
+    dplyr::select(from, to, estimate, se, lower, upper, is_self, sig, type)
+  clim_all <- td_all %>% dplyr::transmute(
+    from    = predictor,
+    to      = species,
+    estimate, se, lower, upper,
+    is_self = FALSE,
+    sig     = sig,
+    type    = "climate")
+
+  # combined coefficients (significant only)
+  sigEdges <- dplyr::bind_rows(
+    drift_all %>% dplyr::filter(sig),
+    clim_all  %>% dplyr::filter(sig))
+  sigEdges$type <- as.character(sigEdges$type)  # avoid factor level issues
+  sigEdges$type <- dplyr::case_when(
+    sigEdges$is_self ~ "self",
+    sigEdges$type == "drift" ~ "competition",
+    TRUE ~ sigEdges$type)
+  sigEdges <- subset(sigEdges, select = -c(is_self, sig))
+  
+  # end mod2 if loop
+  } 
+
+
+
+  # --- Number of species and climate effects --- #
+  tmp1 <- subset(sigEdges, type == "competition")
+  tmp2 <- subset(sigEdges, type == "climate")
+  res$numSppEffects[i] <- nrow(tmp1)
+  res$numClimEffects[i] <- nrow(tmp2)
+
+
+
+  # --- Measures of species importance and centrality --- #
+  # compute perturbation-based measures of species importance
+  DRsamps <- mod1$stanfit$transformedparsfull$pop_DRIFT  # dims: draws x n x n
+  drift_full <- apply(DRsamps, c(2,3), median)             # posterior matrix
+  rownames(drift_full) <- colnames(drift_full) <- mod1$ctstanmodel$latentNames
+  species_names <- mod1$ctstanmodel$latentNames
+  n_species <- length(species_names)
+  drift_sub <- drift_full[species_names, species_names]
+  A <- expm(drift_sub)
+  initial_state <- rep(1, n_species); names(initial_state) <- species_names
+  baseline <- A %*% initial_state; rownames(baseline) <- species_names
+  importance <- numeric(n_species); names(importance) <- species_names
+  for (s in species_names) {
+    perturbed_state <- initial_state; perturbed_state[s] <- 1.1 * perturbed_state[s]
+    perturbed <- A %*% perturbed_state; rownames(perturbed) <- species_names
+    delta <- abs(perturbed - baseline)
+    importance[s] <- mean(delta[rownames(delta) != s])}
+  importance_df <- data.frame(species = names(importance), importance = importance, row.names = NULL)
+  spplist1 <- data.frame(species = manifestVars) %>% left_join(importance_df, by = "species")
+
+  # calculate centrality for each species
+  if (exists("sigEdges")) {edges_comp <- sigEdges %>%
+    dplyr::filter(type == "competition") %>%
+    dplyr::select(from, to, estimate)
+  } else {
+  # fallback if you only have sigDrift
+  edges_comp <- sigDrift %>%
+    dplyr::filter(from != "self", from != to) %>%      # drop self-edges
+    dplyr::select(from, to, estimate)}
+  if (nrow(edges_comp) > 0) {g <- igraph::graph_from_data_frame(
+    d = edges_comp, directed = TRUE, vertices = data.frame(name = manifestVars)  )
+  w <- 1 / (abs(igraph::E(g)$estimate) + 1e-6)
+  degree_in  <- igraph::degree(g, mode = "in")
+  degree_out <- igraph::degree(g, mode = "out")
+  degree_tot <- igraph::degree(g, mode = "all")
+  close_vals <- igraph::closeness(g, mode = "all", weights = w, normalized = TRUE)
+  between    <- igraph::betweenness(g, directed = TRUE, weights = w, normalized = TRUE)
+  centrality_df <- data.frame(
+    species = names(degree_tot),
+    centrality_degree_in  = as.numeric(degree_in),
+    centrality_degree_out = as.numeric(degree_out),
+    centrality_total      = as.numeric(degree_tot),
+    centrality_closeness  = as.numeric(close_vals),
+    centrality_betweenness= as.numeric(between),
+    row.names = NULL  )
+  } else {
+  centrality_df <- data.frame(
+    species = manifestVars,
+    centrality_degree_in = 0,
+    centrality_degree_out = 0,
+    centrality_total = 0,
+    centrality_closeness = 0,
+    centrality_betweenness = 0  )}
+  spplist1 <- dplyr::left_join(spplist1, centrality_df, by = "species") %>%
+    dplyr::mutate(dplyr::across(dplyr::starts_with("centrality_"), ~tidyr::replace_na(., 0)))
+
+
+
+  # --- Plot (black, uniform width; labels = mean (SE); self-loops included) --- #
+  # safety: add SE if it wasn't added earlier
+  if (!"se" %in% names(semCoef)) {semCoef$se <- (semCoef$upper - semCoef$lower) / 3.92}
+
+  # drift (species -> species), significance: self two-sided; cross one-sided (upper < 0)
+  drift_all <- semCoef %>%
+    dplyr::filter(grepl("^drift_", parameter)) %>%
+    dplyr::mutate(
+      to       = sub("^drift_([^_]+)_.+$", "\\1", parameter),
+      from_raw = sub("^drift_[^_]+_(.+)$", "\\1", parameter),
+      from     = ifelse(from_raw == "self", to, from_raw),
+      is_self  = (from_raw == "self"),
+      sig      = ifelse(is_self, !(lower <= 0 & upper >= 0), upper < 0),
+      lab      = sprintf("%.2f (%.2f)", estimate, se)  ) %>%
+    dplyr::filter(from %in% manifestVars, to %in% manifestVars) %>%
+    dplyr::select(from, to, estimate, se, lower, upper, is_self, sig, lab)
+  drift_sig <- drift_all %>% dplyr::filter(sig)
+
+  # climate (predictor -> species), significance: two-sided
+  td_all <- semCoef %>%
+    dplyr::filter(grepl("^beta_", parameter)) %>%
+    dplyr::mutate(
+      species   = sub("^beta_([^_]+)_.+$", "\\1", parameter),
+      predcode  = sub("^beta_[^_]+_(.+)$", "\\1", parameter),
+      predictor = dplyr::recode(predcode,
+        temp   = "tempMean",
+        precip = "precipTotal",
+        swe    = "sweMean"),
+      sig       = !(lower <= 0 & upper >= 0),
+      lab       = sprintf("%.2f (%.2f)", estimate, se)) %>%
+    dplyr::transmute(
+      from = predictor, to = species,
+      estimate, se, lower, upper,
+      is_self = FALSE, sig, lab  ) %>%
+    dplyr::filter(to %in% manifestVars)
+  clim_sig <- td_all %>% dplyr::filter(sig)
+
+  # combine significant edges 
+  sigEdges <- dplyr::bind_rows(drift_sig, clim_sig)
+  sigDrift_cross <- subset(sigDrift, from != to) # exclude self edges
+
+  # build vertex set: species + any climate nodes that actually appear (significant)
+  all_nodes <- unique(c(manifestVars, sigEdges$from, sigEdges$to))
+  climate_nodes <- intersect(c("tempMean","precipTotal","sweMean"), all_nodes)
+  species_nodes <- intersect(manifestVars, all_nodes)
+  g <- igraph::graph_from_data_frame(
+    d = sigEdges[, c("from","to","estimate","lab")],
+    directed = TRUE,
+    vertices = data.frame(name = all_nodes))
+
+  # styling: black, uniform width; labels = mean (SE)
+  E(g)$color       <- "black"
+  E(g)$width       <- 2
+  E(g)$lty         <- 1               # only significant edges are drawn
+  E(g)$arrow.size  <- 0.8
+  E(g)$curved      <- 0.2
+  E(g)$label       <- sigEdges$lab
+  E(g)$label.color <- "black"
+  E(g)$label.cex   <- 0.9
+  V(g)$label <- V(g)$name
+  V(g)$size  <- 28
+  V(g)$label.cex <- 0.9
+
+  # layout: species in a circle; climate (if any) on a horizontal row above
+  nspp <- length(species_nodes)
+  ncli <- length(climate_nodes)
+  if (nspp == 0L) {
+    coords <- matrix(0, nrow = igraph::vcount(g), ncol = 2)
+    rownames(coords) <- V(g)$name} else {
+    ang   <- seq(0, 2*pi, length.out = nspp + 1)[- (nspp + 1)]
+    sp_xy <- cbind(cos(ang), sin(ang)); rownames(sp_xy) <- species_nodes
+    if (ncli > 0L) {
+      xcli <- if (ncli == 1L) 0 else seq(-1.2, 1.2, length.out = ncli)
+      cl_xy <- cbind(xcli, rep(1.8, ncli)); rownames(cl_xy) <- climate_nodes
+      coords <- rbind(sp_xy, cl_xy)  } else coords <- sp_xy
+      missing_nodes <- setdiff(V(g)$name, rownames(coords))
+    if (length(missing_nodes)) {
+      add_xy <- matrix(0, nrow = length(missing_nodes), ncol = 2,
+        dimnames = list(missing_nodes, c("x","y")))
+      coords <- rbind(coords, add_xy)  }}
+  coords <- coords[V(g)$name, , drop = FALSE]
+  safe_site <- gsub("[^A-Za-z0-9_\\-]", "_", siteHabitat_i)
+  jpeg(paste0("MS Association network/Analysis/Results/Graphs_by_site/graph_", safe_site, ".jpg"),
+    width = 1200, height = 900, res = 150)
+  plot(g, layout = coords)
+  invisible(dev.off())
+
+
+
+  # --- Wrap up --- #
+  if (exists("sigDrift")) {
+    write.csv(semCoef, paste0("MS Association network/Analysis/Results/Results_by_site/SEM_allCoefs_", siteHabitat_i, "_250601.csv"), row.names = F)
+    write.csv(sigDrift, paste0("MS Association network/Analysis/Results/Results_by_site/SEM_sigCoefs_", siteHabitat_i, "_250601.csv"), row.names = F)
+    write.csv(spplist1, paste0("MS Association network/Analysis/Results/Results_by_site/spplist_", siteHabitat_i, "_250601.csv"), row.names = F)
+    res$connectance[i] <- if (length(manifestVars) > 1)
+      nrow(sigDrift_cross) / (length(manifestVars) * (length(manifestVars) - 1)) else NA
+    res$propBadRhat[i] <- propBadRhat
+
+    # remove unnecessary objects created during this iteration
+    .keep_now <- union(.stuffToKeep, .alwaysKeep)
+    rm(list = setdiff(ls(all.names = TRUE), .keep_now))
+    invisible(gc())    } 
+
+  # end tryCatch
+  }, error = function(e) {
+    .keep_now <- union(.stuffToKeep, .alwaysKeep)
+    rm(list = setdiff(ls(all.names = TRUE), .keep_now))
+    invisible(gc())  })
+
+  # end i loop
+  }
+Sys.time() - start 
+
+
+
+
+
+# ------- Save -------- #
+write.csv(res, "MS Association network/Analysis/Results/Modeling_results_250918.csv", row.names = F)
+#save.image(file = "MS Association network/Analysis/Results/AssocNetwork_workspace_250601.RData")
+rm(.stuffToKeep, .alwaysKeep)
+
+
+
+
+
+
+
+################### END CODE ##############################################################################
+
+
+
+
+
+
+
+
+
+
+
